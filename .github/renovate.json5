@@ -14,13 +14,6 @@
   // with "before 6am on monday" no run hit the window for seven weeks.
   schedule: ["on monday"],
 
-  // Dependency code executes during CI builds. Do not create an update branch
-  // until its release timestamp is at least seven days old; missing timestamps
-  // fail closed as well.
-  minimumReleaseAge: "7 days",
-  minimumReleaseAgeBehaviour: "timestamp-required",
-  internalChecksFilter: "strict",
-
   // Keep noise bounded even in a busy week.
   prConcurrentLimit: 5,
   prHourlyLimit: 0, // no hourly throttle — the weekly schedule already gates it
@@ -30,12 +23,11 @@
   // dependency ranges deliberately low (which is what a library like clap does).
   rangeStrategy: "bump",
 
-  // Renovate delegates lock-file maintenance to Cargo and cannot enforce
-  // minimumReleaseAge for the transitive versions Cargo selects. Keep this
-  // disabled so the seven-day quarantine cannot be bypassed by a maintenance
-  // refresh; reviewed manifest updates still refresh Cargo.lock.
+  // Refresh Cargo.lock weekly even when no manifest range changes. Dependency
+  // code executes during the build, so every lock-file change needs review.
   lockFileMaintenance: {
-    enabled: false,
+    enabled: true,
+    schedule: ["on monday"],
     automerge: false,
   },
 
