@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use teloxide::dispatching::ShutdownToken;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, UpdateKind};
-use teloxide::update_listeners::webhooks;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -21,6 +20,7 @@ mod limits;
 mod messages;
 mod render;
 mod stats;
+mod webhook;
 mod worker;
 
 use admin::AdminNotifier;
@@ -136,11 +136,7 @@ async fn main() -> Result<()> {
                 url,
                 secret,
             } => {
-                let mut options = webhooks::Options::new(listen, url);
-                if let Some(s) = secret {
-                    options = options.secret_token(s);
-                }
-                let listener = webhooks::axum(bot.clone(), options)
+                let (listener, server) = webhook::start(bot.clone(), listen, url, secret)
                     .await
                     .context("setting up webhook listener")?;
                 dispatcher
@@ -149,6 +145,7 @@ async fn main() -> Result<()> {
                         LoggingErrorHandler::with_custom_text("webhook listener error"),
                     )
                     .await;
+                server.await.context("webhook server task failed")??;
             }
             Transport::Polling => {
                 // Local-dev fallback. Requires no public endpoint.
@@ -228,7 +225,7 @@ enum Transport {
     Webhook {
         listen: SocketAddr,
         url: Url,
-        secret: Option<String>,
+        secret: String,
     },
     Polling,
 }
@@ -246,7 +243,7 @@ impl std::fmt::Debug for Transport {
                 .debug_struct("Webhook")
                 .field("listen", listen)
                 .field("url", &url.as_str())
-                .field("secret", &secret.as_ref().map(|_| "<redacted>"))
+                .field("secret", &"<redacted>")
                 .finish(),
             Transport::Polling => f.write_str("Polling"),
         }
@@ -267,8 +264,8 @@ impl Config {
                     .parse()
                     .context("WEBHOOK_LISTEN is not a valid socket address")?;
                 let secret = std::env::var("WEBHOOK_SECRET")
-                    .ok()
-                    .filter(|s| !s.is_empty());
+                    .context("WEBHOOK_SECRET is required in webhook mode")?;
+                validate_webhook_secret(&secret)?;
                 Transport::Webhook {
                     listen,
                     url,
@@ -304,6 +301,20 @@ impl Config {
             stats_listen,
         })
     }
+}
+
+fn validate_webhook_secret(secret: &str) -> Result<()> {
+    anyhow::ensure!(
+        (32..=256).contains(&secret.len()),
+        "WEBHOOK_SECRET must contain 32 to 256 characters"
+    );
+    anyhow::ensure!(
+        secret
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "WEBHOOK_SECRET may only contain A-Z, a-z, 0-9, _ and -"
+    );
+    Ok(())
 }
 
 fn init_tracing() {
@@ -484,5 +495,12 @@ mod supervision_tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn webhook_secret_requires_telegram_charset_and_minimum_length() {
+        assert!(validate_webhook_secret("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_webhook_secret("short").is_err());
+        assert!(validate_webhook_secret("0123456789abcdef0123456789abcde!").is_err());
     }
 }

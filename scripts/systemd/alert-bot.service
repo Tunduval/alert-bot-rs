@@ -34,6 +34,7 @@ RestrictRealtime=true
 # Resource caps — bot baseline is tiny; raise if you see OOMs
 MemoryMax=256M
 TasksMax=64
+LimitNOFILE=256
 
 [Install]
 WantedBy=multi-user.target

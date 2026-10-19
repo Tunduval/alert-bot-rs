@@ -12,7 +12,7 @@ readonly MAX_BINARY_BYTES=67108864
 readonly SERVICE=alert-bot
 readonly RECEIVER=/usr/local/sbin/alertbot-deploy-receiver.sh
 readonly SERVICE_UNIT=/etc/systemd/system/alert-bot.service
-readonly SERVICE_UNIT_SHA256=0b1e1eaf92b1ab63e035f0a0a4985400fee21a9696abe0f5d42ec72c2fc7e3b1
+readonly SERVICE_UNIT_SHA256=deaa8e4c95809256ac2ab604ba8ec4fb38dc688463e2d06985d3d0d7dcac3677
 readonly TARGET=/usr/local/bin/alert-bot
 
 reject() {
