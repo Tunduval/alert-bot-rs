@@ -202,7 +202,7 @@ deploy receiver. CI later uses the same path (step 7).
 # on the compatible Linux build machine
 cargo build --release --bin alert-bot
 strip target/release/alert-bot
-ssh root@<lxc-ip> /usr/local/sbin/alertbot-deploy-receiver.sh \
+ssh root@<lxc-ip> env -i /usr/local/sbin/alertbot-deploy-receiver.sh \
     < target/release/alert-bot
 
 # on the LXC
@@ -288,25 +288,76 @@ trap - EXIT
 The GitHub Actions workflow connects to the LXC over Cloudflare Access
 SSH — no SSH port needs to be exposed on the LXC.
 
+Create an unprivileged account that exists only to enter the root-owned deploy
+receiver. The clean `env -i` boundary is inside the exact `sudoers` command, so
+SSH environment variables can never reach a root shell or interpreter.
+
+```bash
+# on the LXC
+useradd --system --home-dir /var/lib/alertbot-deploy --no-create-home \
+    --shell /bin/sh alertbot-deploy
+install -d -o root -g root -m 0755 /var/lib/alertbot-deploy
+install -d -o root -g root -m 0755 /var/lib/alertbot-deploy/.ssh
+install -o root -g root -m 0600 /dev/null \
+    /var/lib/alertbot-deploy/.ssh/authorized_keys
+
+cat > /etc/sudoers.d/alertbot-deploy <<'EOF'
+Defaults:alertbot-deploy env_reset,secure_path=/usr/sbin:/usr/bin:/sbin:/bin
+alertbot-deploy ALL=(root:root) NOPASSWD:NOSETENV: /usr/bin/env -i /usr/local/sbin/alertbot-deploy-receiver.sh
+EOF
+chmod 0440 /etc/sudoers.d/alertbot-deploy
+visudo -cf /etc/sudoers.d/alertbot-deploy
+```
+
+Limit this account at the SSH daemon as a second layer. Validate the complete
+server configuration before reloading it.
+
+```bash
+cat > /etc/ssh/sshd_config.d/00-alertbot-deploy.conf <<'EOF'
+# Global directive. Keep it before the Match block.
+PermitUserEnvironment no
+
+Match User alertbot-deploy
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PermitTTY no
+    DisableForwarding yes
+    PermitTunnel no
+    PermitUserRC no
+    ForceCommand /usr/bin/env -i /usr/bin/sudo -n -- /usr/bin/env -i /usr/local/sbin/alertbot-deploy-receiver.sh
+
+Match all
+EOF
+sshd -t
+sshd -T -C user=alertbot-deploy,host=localhost,addr=127.0.0.1 | \
+    grep -Ei '^(authenticationmethods|passwordauthentication|kbdinteractiveauthentication|permittty|disableforwarding|permituserrc|permittunnel|permituserenvironment|forcecommand) '
+systemctl reload ssh
+```
+
 **Generate a dedicated key pair** (don't reuse your personal one):
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/alertbot-deploy -C "github-actions-deploy"
 deploy_key=$(cat ~/.ssh/alertbot-deploy.pub)
 ssh root@<lxc-ip> "printf '%s %s\\n' \
-  'restrict,command=\"env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/local/sbin/alertbot-deploy-receiver.sh\"' \
-  '$deploy_key' >> /root/.ssh/authorized_keys"
+  'restrict,command=\"/usr/bin/env -i /usr/bin/sudo -n -- /usr/bin/env -i /usr/local/sbin/alertbot-deploy-receiver.sh\"' \
+  '$deploy_key' >> /var/lib/alertbot-deploy/.ssh/authorized_keys"
 unset deploy_key
 ```
 
 The forced command accepts one ELF binary of at most 64 MiB, installs it
-atomically, and restarts only `alert-bot`. The key cannot open a shell, forward
-ports, run `scp`, or invoke another root command. Test the restriction before
-adding the private key to GitHub:
+atomically, and restarts only `alert-bot`. It refuses concurrent deploys and
+refuses to run if the reviewed service unit or its non-root sandbox changed.
+The key cannot open a shell, forward ports, run `scp`, or invoke another root
+command. If its forced shell were ever bypassed, the attacker would still be
+the unprivileged `alertbot-deploy` user and `sudo` would still allow only the
+clean-environment receiver. Test the restriction before adding the private key
+to GitHub:
 
 ```bash
-ssh -i ~/.ssh/alertbot-deploy root@<lxc-ip> id </dev/null
-# Expected: "deploy rejected", never uid=0 output.
+ssh -i ~/.ssh/alertbot-deploy alertbot-deploy@<lxc-ip> id </dev/null
+# Expected: "deploy rejected", never uid output.
 ```
 
 **Cloudflare Tunnel → SSH route + Access policy.** Same cloudflared
@@ -333,7 +384,7 @@ repository secrets:
 | Secret   | `CF_ACCESS_CLIENT_ID`         | from the Service Token                     |
 | Secret   | `CF_ACCESS_CLIENT_SECRET`     | from the Service Token                     |
 | Variable | `SSH_HOST`                    | `ssh-alert.yourdomain.de`                  |
-| Variable | `SSH_USER`                    | `root`                                     |
+| Variable | `SSH_USER`                    | `alertbot-deploy`                          |
 
 Collect the LXC SSH host key over a trusted path and verify its fingerprint
 out of band before saving the complete `known_hosts` line. The workflow uses
@@ -351,11 +402,15 @@ Complete the following migration **before merging the hardened workflow**:
    environment.
 3. Delete every repository- and organization-level copy of those production
    secrets that could still reach this repository.
-4. Create the branch ruleset and verify that `.github/CODEOWNERS` requires the
+4. Install the checked-in service unit and deploy receiver. Create the
+   `alertbot-deploy` account, SSH policy, and exact `sudoers` rule from step 7.
+   Remove the old deploy key from root's `authorized_keys`, then verify the new
+   key cannot run `id` or open a shell.
+5. Create the branch ruleset and verify that `.github/CODEOWNERS` requires the
    owner to review workflow changes.
-5. Cancel any still-running legacy deploy. Do not re-run an old deploy; delete
+6. Cancel any still-running legacy deploy. Do not re-run an old deploy; delete
    old runs if their continued availability is not required for audit.
-6. Set the repository variable `PRODUCTION_DEPLOY_ENABLED=true` last.
+7. Set the repository variable `PRODUCTION_DEPLOY_ENABLED=true` last.
 
 The final variable is an explicit fail-closed gate. Without it the workflow
 still tests and builds `master`, but the deploy job remains skipped. Environment

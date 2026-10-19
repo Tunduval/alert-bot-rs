@@ -136,7 +136,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
-          [[ "$SSH_USER" == "root" ]]
+          [[ "$SSH_USER" == "alertbot-deploy" ]]
 
           cat > "$RUNNER_TEMP/cloudflared-proxy" <<'PROXY'
           #!/usr/bin/env bash
@@ -155,4 +155,8 @@ jobs:
             -o ConnectTimeout=20
           )
 
-          ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" < release/alert-bot
+          local_sha=$(sha256sum release/alert-bot)
+          local_sha=${local_sha%% *}
+          expected="alert-bot deployed sha256=$local_sha"
+          actual=$(ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" < release/alert-bot)
+          [[ "$actual" == "$expected" ]]
