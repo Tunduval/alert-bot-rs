@@ -295,16 +295,9 @@ pub fn series_stopped(lang: Language, id: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Anti-spam / quota errors. Kept short so they also fit Telegram's ~200-char
-// callback-query toast limit.
+// Quota errors. Kept short so they also fit Telegram's ~200-char callback-query
+// toast limit.
 // ---------------------------------------------------------------------------
-
-pub fn rate_limited(lang: Language) -> &'static str {
-    match lang {
-        Language::De => "Zu viele Befehle in kurzer Zeit. Probier's gleich nochmal.",
-        Language::En => "Too many commands too fast. Try again in a moment.",
-    }
-}
 
 pub fn user_quota_exceeded(lang: Language, current: i64, max: i64) -> String {
     match lang {
