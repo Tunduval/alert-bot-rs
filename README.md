@@ -672,7 +672,9 @@ crates/
 - **Webhook** verifies the Telegram secret before reading the body. It accepts
   at most 64 KiB within five seconds and queues at most 128 updates. A full
   queue returns HTTP 429 so Telegram applies backpressure. Invalid or future
-  update types are discarded without logging their raw payload.
+  update types are discarded without logging their raw payload. Sixteen fixed
+  dispatcher shards with eight queued updates each prevent attacker-selected
+  chat IDs from creating an unbounded number of Teloxide workers.
 - **Worker** sleeps until the earliest pending alert's `fire_at` or until
   Postgres `NOTIFY alerts_changed` wakes it. Claimed alerts cycle
   `pending → claimed → sent`. Each worker claims one alert at a time; every

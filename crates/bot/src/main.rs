@@ -28,6 +28,8 @@ use commands::Command;
 use limits::CommandRateLimiter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const DISPATCH_SHARDS: i64 = 16;
+const DISPATCH_WORKER_QUEUE_SIZE: usize = 8;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -117,6 +119,11 @@ async fn main() -> Result<()> {
     // and feeds the dispatcher's ShutdownToken on either.
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
         .dependencies(dptree::deps![store.clone(), rate_limiter.clone()])
+        // Teloxide otherwise creates one worker and queue per attacker-chosen
+        // chat id. Fixed shards preserve per-chat ordering while bounding the
+        // total workers and making webhook backpressure reach the HTTP queue.
+        .distribution_function(dispatch_shard)
+        .worker_queue_size(DISPATCH_WORKER_QUEUE_SIZE)
         // Root filters intentionally drop unsupported and rate-limited input.
         // Teloxide's default handler logs the complete Debug update, including
         // user text, which would turn a rejected flood into journal egress.
@@ -176,6 +183,15 @@ fn ingress_user_id(update: &Update) -> Option<i64> {
         UpdateKind::CallbackQuery(query) => Some(query.from.id.0 as i64),
         _ => None,
     }
+}
+
+fn dispatch_shard(update: &Update) -> Option<u8> {
+    let key = update
+        .chat()
+        .map(|chat| chat.id.0)
+        .or_else(|| ingress_user_id(update))
+        .unwrap_or(i64::from(update.id.0));
+    Some(key.rem_euclid(DISPATCH_SHARDS) as u8)
 }
 
 /// Observe the worker while dispatching. A dead delivery task must fail the
@@ -502,5 +518,24 @@ mod supervision_tests {
         assert!(validate_webhook_secret("0123456789abcdef0123456789abcdef").is_ok());
         assert!(validate_webhook_secret("short").is_err());
         assert!(validate_webhook_secret("0123456789abcdef0123456789abcde!").is_err());
+    }
+
+    #[test]
+    fn dispatcher_uses_a_fixed_number_of_shards() {
+        let first: Update = serde_json::from_str(
+            r#"{"update_id":1,"message":{"message_id":1,"date":0,"chat":{"id":-42,"type":"group"},"text":"/help"}}"#,
+        )
+        .unwrap();
+        let second: Update = serde_json::from_str(
+            r#"{"update_id":2,"message":{"message_id":2,"date":0,"chat":{"id":-42,"type":"group"},"text":"/list"}}"#,
+        )
+        .unwrap();
+        let future: Update =
+            serde_json::from_str(r#"{"update_id":4294967295,"future_update":{}}"#).unwrap();
+
+        assert_eq!(dispatch_shard(&first), dispatch_shard(&second));
+        for update in [&first, &second, &future] {
+            assert!(dispatch_shard(update).unwrap() < DISPATCH_SHARDS as u8);
+        }
     }
 }
