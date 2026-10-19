@@ -15,7 +15,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.53.2", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 
 # Telegram (pulls axum transitively via the `webhooks-axum` feature)
