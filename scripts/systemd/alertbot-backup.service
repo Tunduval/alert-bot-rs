@@ -6,11 +6,31 @@ Requires=postgresql.service
 
 [Service]
 Type=oneshot
-# Run as the postgres system user so peer-auth gives us full access to
-# every database via the local Unix socket — no password in the env file.
-User=postgres
-Group=postgres
+TimeoutStartSec=1h
+# Dedicated identity: the bot process cannot inspect this service's secrets.
+User=alertbot-backup
+Group=alertbot-backup
 EnvironmentFile=/etc/alertbot-backup.env
+LoadCredential=backup-signing-key:/etc/alertbot-backup/signing-private.pem
 ExecStart=/usr/local/bin/alertbot-backup.sh
 StandardOutput=journal
 StandardError=journal
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
