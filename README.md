@@ -46,6 +46,8 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
 - **Group reminders with two scopes**
   - `/alert` in a group fires in the group, but only the creator can cancel it.
   - `/galert` is a shared group reminder; anyone in the chat can cancel.
+  - Commands sent as an anonymous administrator or on behalf of a chat are
+    ignored because Telegram does not provide a trustworthy user identity.
 - **Delivery controls** — snooze by 5 minutes, 15 minutes or 1 hour; stop a
   recurring series directly from its delivered message.
 - **Per-user language and timezone** — auto-detected from Telegram's
@@ -121,19 +123,17 @@ the same LXC.
 
 #### 1. Create the LXC
 
-On the Proxmox host, use the community-scripts PostgreSQL helper — it
-gives you a Debian-12 LXC with Postgres 16 pre-installed and the standard
-`local all all peer` line in `pg_hba.conf`:
+Create a dedicated, unprivileged Debian LXC from a trusted template. Pin or
+record the exact template digest before creating the container so a rebuild
+uses the same reviewed input. Do not pipe a downloaded community script into a
+root shell.
 
-```bash
-bash -c "$(wget -qLO - https://community-scripts.org/scripts/postgresql)"
-```
-
-Pick the non-Alpine variant. The size difference is irrelevant on a
-dedicated DB LXC and Debian's glibc matches what GitHub Actions produces
-for the bot binary. Defaults are fine (2 CPU / 2 GB / 8 GB disk).
-
-Note the LXC's IP — the script prints it at the end.
+Install the required system packages from Debian's signed repositories. If the
+exact PostgreSQL 16 release is not in that Debian release, use PostgreSQL's
+official signed APT repository. Keep the container minimal (2 CPU / 2 GB /
+8 GB disk is enough for a small instance), enable automatic security updates,
+and record the LXC's internal IP. Confirm that local PostgreSQL connections use
+peer authentication before continuing.
 
 #### 2. Postgres role + database + system user
 
@@ -167,23 +167,26 @@ scp scripts/systemd/alert-bot.service       root@<lxc-ip>:/etc/systemd/system/
 scp scripts/systemd/alertbot-backup.service root@<lxc-ip>:/etc/systemd/system/
 scp scripts/systemd/alertbot-backup.timer   root@<lxc-ip>:/etc/systemd/system/
 scp scripts/backup-postgres.sh              root@<lxc-ip>:/usr/local/bin/alertbot-backup.sh
+scp scripts/alertbot-deploy-receiver.sh     root@<lxc-ip>:/usr/local/sbin/
 ```
 
 ```bash
 # on the LXC
-mkdir -p /etc/alert-bot
-cat > /etc/alert-bot/config.env <<EOF
+install -d -o root -g alertbot -m 0750 /etc/alert-bot
+install -o root -g alertbot -m 0640 /dev/null /etc/alert-bot/config.env
+webhook_secret=$(openssl rand -hex 32)
+cat > /etc/alert-bot/config.env <<'EOF'
 BOT_TOKEN=<from BotFather>
 DATABASE_URL=postgres:///alertbot?host=/var/run/postgresql
 ADMIN_CHAT_ID=<your numeric Telegram user id>
 RUST_LOG=info,alert_bot=debug
 # WEBHOOK_URL=         # added in step 5
-# WEBHOOK_SECRET=      # added in step 5
 EOF
-chmod 600 /etc/alert-bot/config.env
-chown -R alertbot:alertbot /etc/alert-bot
+printf 'WEBHOOK_SECRET=%s\n' "$webhook_secret" >> /etc/alert-bot/config.env
+unset webhook_secret
 
 chmod +x /usr/local/bin/alertbot-backup.sh
+chmod 0755 /usr/local/sbin/alertbot-deploy-receiver.sh
 systemctl daemon-reload
 ```
 
@@ -192,21 +195,17 @@ The bot isn't installed yet — that's step 4.
 #### 4. Install the first binary
 
 Until CI is wired up (step 7), build on a Linux machine compatible with the
-LXC architecture and glibc, then scp the binary across. CI later builds on
-Ubuntu and copies directly from the runner (step 7).
+LXC architecture and glibc, then stream the binary through the restricted
+deploy receiver. CI later uses the same path (step 7).
 
 ```bash
 # on the compatible Linux build machine
 cargo build --release --bin alert-bot
 strip target/release/alert-bot
-scp target/release/alert-bot root@<lxc-ip>:/tmp/alert-bot
-```
+ssh root@<lxc-ip> /usr/local/sbin/alertbot-deploy-receiver.sh \
+    < target/release/alert-bot
 
-```bash
 # on the LXC
-install -m 0755 -o root -g root /tmp/alert-bot /usr/local/bin/alert-bot
-rm /tmp/alert-bot
-
 systemctl enable --now alert-bot
 systemctl status alert-bot --no-pager -l
 journalctl -u alert-bot -n 30
@@ -224,7 +223,7 @@ schema is materialised on first boot.
 > `cargo zigbuild --target x86_64-unknown-linux-gnu --release` (needs
 > `brew install zig && cargo install cargo-zigbuild`), or just push the
 > commit and let the CI workflow do the build for you — the workflow
-> scp's straight to the LXC after build.
+> streams the artifact to the restricted LXC receiver after build.
 
 #### 5. Cloudflare Tunnel route → webhook switch
 
@@ -239,17 +238,15 @@ Then on the LXC:
 ```bash
 nano /etc/alert-bot/config.env
 # WEBHOOK_URL=https://alert.yourdomain.de/webhook
-# WEBHOOK_SECRET=$(openssl rand -hex 32)
 
 systemctl restart alert-bot
-
-# verify
-source /etc/alert-bot/config.env
-curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo" | jq
+systemctl is-active --quiet alert-bot
 ```
 
-`url` should match your Cloudflare hostname, `pending_update_count`
-should be `0`.
+The environment file contains secrets. Keep it owned by `root:alertbot` with
+mode `0640`, and never source it into an interactive shell. The webhook secret
+above is generated before the file is written; systemd environment files do
+not evaluate shell substitutions such as `$(openssl ...)`.
 
 #### 6. Migrate data from the old host (skip if starting fresh)
 
@@ -258,19 +255,32 @@ On the source machine (old docker-on-LXC setup):
 ```bash
 docker compose stop bot
 docker compose exec -T postgres \
-    pg_dump -U alertbot --clean --if-exists --no-owner --no-privileges alertbot \
-    > alertbot.sql
-scp alertbot.sql root@<new-lxc-ip>:/tmp/
+    pg_dump -U alertbot --format=custom --no-owner --no-privileges alertbot \
+    > alertbot-migration.dump
+scp alertbot-migration.dump root@<new-lxc-ip>:/root/alertbot-migration.dump
 ```
 
 On the new LXC:
 
 ```bash
+set -euo pipefail
+migration=/root/alertbot-migration.dump
+test -f "$migration"
+test ! -L "$migration"
+chmod 0600 "$migration"
 systemctl stop alert-bot
-sudo -u postgres psql -d alertbot < /tmp/alertbot.sql
-sudo -u postgres psql -d alertbot \
+cleanup_migration() {
+    rm -f -- "$migration"
+    systemctl start alert-bot
+}
+trap cleanup_migration EXIT
+sudo -u alertbot pg_restore --exit-on-error --single-transaction \
+    --clean --if-exists --no-owner --no-privileges \
+    --dbname=alertbot "$migration"
+sudo -u alertbot psql -d alertbot \
     -c "SELECT count(*), max(created_at) FROM alerts;"
-systemctl start alert-bot
+cleanup_migration
+trap - EXIT
 ```
 
 #### 7. Cloudflare Access SSH for CI deploys
@@ -282,7 +292,21 @@ SSH — no SSH port needs to be exposed on the LXC.
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/alertbot-deploy -C "github-actions-deploy"
-ssh-copy-id -i ~/.ssh/alertbot-deploy.pub root@<lxc-ip>
+deploy_key=$(cat ~/.ssh/alertbot-deploy.pub)
+ssh root@<lxc-ip> "printf '%s %s\\n' \
+  'restrict,command=\"env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/local/sbin/alertbot-deploy-receiver.sh\"' \
+  '$deploy_key' >> /root/.ssh/authorized_keys"
+unset deploy_key
+```
+
+The forced command accepts one ELF binary of at most 64 MiB, installs it
+atomically, and restarts only `alert-bot`. The key cannot open a shell, forward
+ports, run `scp`, or invoke another root command. Test the restriction before
+adding the private key to GitHub:
+
+```bash
+ssh -i ~/.ssh/alertbot-deploy root@<lxc-ip> id </dev/null
+# Expected: "deploy rejected", never uid=0 output.
 ```
 
 **Cloudflare Tunnel → SSH route + Access policy.** Same cloudflared
@@ -297,33 +321,108 @@ instance as the webhook route:
     fresh Service Token, copy the Client ID and Client Secret (shown
     only once)
 
-**GitHub repository secrets/variables.** Settings → Secrets and variables
-→ Actions:
+**Protected GitHub environment.** Create an environment named `production`.
+Allow deployments only from `master`, require a reviewer, and enable
+**Prevent self-review**. Store the following values in that environment, not as
+repository secrets:
 
-| Type     | Name                          | Value                                    |
-|----------|-------------------------------|------------------------------------------|
-| Secret   | `LXC_SSH_KEY`                 | contents of `~/.ssh/alertbot-deploy`     |
-| Secret   | `CF_ACCESS_CLIENT_ID`         | from the Service Token                   |
-| Secret   | `CF_ACCESS_CLIENT_SECRET`     | from the Service Token                   |
-| Variable | `SSH_HOST`                    | `ssh-alert.yourdomain.de`                |
-| Variable | `SSH_USER`                    | `root`                                   |
+| Type     | Name                          | Value                                      |
+|----------|-------------------------------|--------------------------------------------|
+| Secret   | `LXC_SSH_KEY`                 | contents of `~/.ssh/alertbot-deploy`       |
+| Secret   | `LXC_SSH_KNOWN_HOSTS`         | verified `known_hosts` line for `SSH_HOST` |
+| Secret   | `CF_ACCESS_CLIENT_ID`         | from the Service Token                     |
+| Secret   | `CF_ACCESS_CLIENT_SECRET`     | from the Service Token                     |
+| Variable | `SSH_HOST`                    | `ssh-alert.yourdomain.de`                  |
+| Variable | `SSH_USER`                    | `root`                                     |
 
-The next code push to `master` triggers tests → build → direct scp/SSH
+Collect the LXC SSH host key over a trusted path and verify its fingerprint
+out of band before saving the complete `known_hosts` line. The workflow uses
+strict host-key checking and fails closed when the key changes.
+
+Protect `master` with a branch ruleset that requires a pull request, at least
+one approval from a code owner, and the `Test` status check. Block force pushes
+and deletion. Do not exempt Renovate or another automation account from these
+rules, and disable auto-merge for changes to GitHub Actions workflows.
+
+Complete the following migration **before merging the hardened workflow**:
+
+1. Create and protect the `production` environment as described above.
+2. Rotate all four production secrets and store the new values only in that
+   environment.
+3. Delete every repository- and organization-level copy of those production
+   secrets that could still reach this repository.
+4. Create the branch ruleset and verify that `.github/CODEOWNERS` requires the
+   owner to review workflow changes.
+5. Cancel any still-running legacy deploy. Do not re-run an old deploy; delete
+   old runs if their continued availability is not required for audit.
+6. Set the repository variable `PRODUCTION_DEPLOY_ENABLED=true` last.
+
+The final variable is an explicit fail-closed gate. Without it the workflow
+still tests and builds `master`, but the deploy job remains skipped. Environment
+protection applies only to environment secrets; it does not protect
+repository-level secrets.
+
+The next code push to `master` triggers tests → build → restricted SSH-stream
 deployment via Cloudflare Access. There is no GitHub Release step.
 
 #### 8. Nightly off-site backup → Netcup SFTP
 
 ```bash
-apt install -y curl sshpass postgresql-client
+apt install -y curl openssl sshpass postgresql-client
 
+# Keep backup credentials outside the bot's Unix identity.
+useradd --system --no-create-home --shell /usr/sbin/nologin alertbot-backup
+sudo -u postgres createuser --no-createdb --no-createrole --no-superuser alertbot-backup
+sudo -u postgres psql -v ON_ERROR_STOP=1 --dbname alertbot <<'SQL'
+GRANT CONNECT ON DATABASE alertbot TO "alertbot-backup";
+GRANT USAGE ON SCHEMA public TO "alertbot-backup";
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO "alertbot-backup";
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO "alertbot-backup";
+SQL
+sudo -u alertbot psql -v ON_ERROR_STOP=1 --dbname alertbot <<'SQL'
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT ON TABLES TO "alertbot-backup";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT ON SEQUENCES TO "alertbot-backup";
+SQL
+
+# Confirm peer authentication and the narrowly scoped read access.
+sudo -u alertbot-backup psql -v ON_ERROR_STOP=1 --dbname alertbot \
+  --command 'SELECT count(*) FROM alerts;'
+
+ssh-keyscan -t ed25519 yourhost.netcup.net \
+  > /etc/alertbot-backup-known-hosts
+ssh-keygen -lf /etc/alertbot-backup-known-hosts
+# Compare this fingerprint with the provider's value over a separate,
+# trusted channel before continuing.
+chown root:root /etc/alertbot-backup-known-hosts
+chmod 0644 /etc/alertbot-backup-known-hosts
+host_key_sha256=$(ssh-keygen -lf /etc/alertbot-backup-known-hosts \
+  | awk 'NR == 1 {print $2}')
+
+install -o root -g root -m 0600 /dev/null /etc/alertbot-backup.env
 cat > /etc/alertbot-backup.env <<EOF
 BACKUP_NETCUP_HOST=yourhost.netcup.net
 BACKUP_NETCUP_USER=<sftp user>
 BACKUP_NETCUP_PASS=<sftp password>
 BACKUP_NETCUP_PATH=backups/alertbot
+BACKUP_KNOWN_HOSTS=/etc/alertbot-backup-known-hosts
+BACKUP_SFTP_HOSTKEY_SHA256=${host_key_sha256#SHA256:}
 RETENTION_DAYS=30
 EOF
-chmod 600 /etc/alertbot-backup.env
+unset host_key_sha256
+
+# Keep the private signing key root-only. systemd exposes it only to the
+# dedicated backup service through LoadCredential.
+umask 077
+install -o root -g root -m 0700 -d /etc/alertbot-backup
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+  -out /etc/alertbot-backup/signing-private.pem
+openssl pkey -in /etc/alertbot-backup/signing-private.pem -pubout \
+  -out /etc/alertbot-backup/signing-public.pem
+chown root:root /etc/alertbot-backup/signing-*.pem
+chmod 0600 /etc/alertbot-backup/signing-private.pem
+chmod 0644 /etc/alertbot-backup/signing-public.pem
 
 systemctl daemon-reload
 systemctl enable --now alertbot-backup.timer
@@ -331,24 +430,73 @@ systemctl start alertbot-backup.service        # test now
 journalctl -u alertbot-backup -n 30
 ```
 
-Daily from 03:30 UTC (up to 15 minutes randomized delay), the timer streams a
-gzipped `pg_dump` to Netcup as `.part`. A separate rename publishes the final
-filename only after dump, compression and upload have all succeeded. The script
-prunes matching final dumps older than `RETENTION_DAYS` on the remote side.
+Daily from 03:30 UTC, with up to 15 minutes randomized delay, the timer creates
+a PostgreSQL custom-format dump. The script signs its SHA-256 hash with RSA. It
+uploads the dump and detached signature as `.part` files. Separate renames
+publish the signature first and the dump last. The script prunes matching
+`.dump` and `.dump.sig` files after `RETENTION_DAYS`.
+
+The unit runs as `alertbot-backup`. PostgreSQL peer authentication maps that
+Unix account to the matching database role. That role has only `CONNECT`,
+schema `USAGE`, and `SELECT` grants; it cannot assume the application owner.
+The `postgres` superuser is not required. The bot's Unix account cannot read
+the SFTP environment file or private signing key.
 
 ### Restoring from backup
 
 ```bash
+set -euo pipefail
+restore_dir=$(mktemp -d /root/alertbot-restore.XXXXXX)
+bot_stopped=0
+cleanup_restore() {
+    rm -rf -- "$restore_dir"
+    if (( bot_stopped )); then
+        systemctl start alert-bot
+    fi
+}
+trap cleanup_restore EXIT
+backup="$restore_dir/alertbot.dump"
+signature="$backup.sig"
+host_key_sha256=$(sed -n \
+  's/^BACKUP_SFTP_HOSTKEY_SHA256=//p' /etc/alertbot-backup.env)
+[[ "$host_key_sha256" =~ ^[A-Za-z0-9+/]{43}$ ]]
+
+read -r -p 'SFTP user: ' BACKUP_NETCUP_USER
+curl --fail --show-error --silent \
+    --connect-timeout 15 --max-time 1800 --max-filesize 1073741824 \
+    --user "$BACKUP_NETCUP_USER" \
+    --hostpubsha256 "$host_key_sha256" \
+    --output "$backup" \
+    "sftp://your-netcup-host/backups/alertbot/alertbot-2026-05-09T033000Z.dump"
+curl --fail --show-error --silent \
+    --connect-timeout 15 --max-time 60 --max-filesize 16384 \
+    --user "$BACKUP_NETCUP_USER" \
+    --hostpubsha256 "$host_key_sha256" \
+    --output "$signature" \
+    "sftp://your-netcup-host/backups/alertbot/alertbot-2026-05-09T033000Z.dump.sig"
+
+# Abort before stopping the bot if either file is missing or manipulated.
+openssl dgst -sha256 -verify /etc/alertbot-backup/signing-public.pem \
+  -signature "$signature" "$backup"
+
 systemctl stop alert-bot
-curl --user "$BACKUP_NETCUP_USER:$BACKUP_NETCUP_PASS" \
-    "sftp://your-netcup-host/backups/alertbot/alertbot-2026-05-09T033000Z.sql.gz" \
-  | gunzip \
-  | sudo -u postgres psql -d alertbot
+bot_stopped=1
+sudo -u alertbot pg_restore \
+  --exit-on-error --single-transaction --clean --if-exists \
+  --no-owner --no-privileges --dbname=alertbot "$backup"
 systemctl start alert-bot
+bot_stopped=0
+cleanup_restore
+trap - EXIT
 ```
 
-`pg_dump --clean --if-exists` drops and recreates backed-up objects. Restoring
-replaces their current data; first preserve any data you still need.
+Never restore an unsigned dump. Never use a public key downloaded beside the
+dump. Only the pinned local public key proves that the backup host did not
+replace the archive. `pg_restore --clean --if-exists` drops and recreates the
+backed-up objects. It runs as the narrowly privileged application owner, not as
+the PostgreSQL superuser. First preserve any current data you still need. A
+failed restore leaves the bot stopped so it cannot use a partially restored
+database.
 
 ## Update workflow (CI/CD)
 
@@ -360,56 +508,59 @@ entire build, and only the stripped release binary (a few MB) is shipped to the
 LXC. The container stays minimal: it runs the binary and Postgres, nothing else
 — smaller footprint, smaller attack surface, faster restores.
 
-Push to `master` → GitHub Actions builds → runner scp's straight to the
-LXC and restarts. The full pipeline is in
+Pull requests run the complete check suite. A push to protected `master`
+adds a release build and deploy. The full pipeline is in
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
 
 ```mermaid
 flowchart TD
-    trig["push to main / master<br/>(skips *.md, docs/, .gitignore)<br/>· or manual workflow_dispatch"] --> test
+    pr["pull request to master"] --> test
+    push["push to protected master"] --> test
 
     subgraph test["Job: test · ubuntu-22.04"]
         t1[checkout + Rust toolchain] --> t2[restore crate cache]
-        t2 --> t3["workspace tests + PostgreSQL integration tests + backup regression tests"]
+        t2 --> t3["./check, including PostgreSQL integration tests"]
     end
 
-    test -->|"needs: test"| deploy
+    test -->|"push only"| build
 
-    subgraph deploy["Job: deploy · ubuntu-22.04 · glibc 2.35 pin"]
-        d1["cargo build --release + strip"] --> d2[install cloudflared]
-        d2 --> d3["write deploy SSH key<br/>secrets.LXC_SSH_KEY"]
-        d3 --> d4["sanity-check Cloudflare<br/>Access service token"]
-        d4 --> d5["scp binary to LXC<br/>over Cloudflare Access SSH"]
-        d5 --> d6["ssh: install + systemctl restart"]
-        d6 --> d7["tail journalctl ~20s"]
+    subgraph build["Job: build · no production secrets"]
+        b1["cargo build --release + strip"] --> b2["upload short-lived artifact"]
     end
 
-    d6 -.->|deploys onto| host[("alert-bot LXC<br/>no public SSH port")]
+    build --> deploy
+
+    subgraph deploy["Job: deploy · protected production environment"]
+        d1["download artifact"] --> d2["verify pinned cloudflared"]
+        d2 --> d3["strict SSH host-key check"]
+        d3 --> d4["stream into forced command"]
+        d4 --> d5["bounded atomic install + restart"]
+    end
+
+    d5 -.->|deploys onto| host[("alert-bot LXC<br/>no public SSH port")]
 ```
 
 1. **Test** — workspace tests, isolated PostgreSQL integration tests, and offline
    backup failure tests.
-2. **Build & deploy** (one job, so the runner can scp the binary it just
-   built):
-   1. `cargo build --release --bin alert-bot` on `ubuntu-22.04`.
-      Pinned so the binary's glibc baseline (2.35) stays compatible
-      with Debian 13 (2.41 — backward-compatible). If we let
-      `ubuntu-latest` drift past Debian, deploy silently breaks.
-   2. `strip target/release/alert-bot`
-   3. `scp` the binary to the LXC over Cloudflare Access SSH.
-   4. On the LXC: `install -m 0755` to `/usr/local/bin/alert-bot`,
-      then `systemctl restart alert-bot`.
-3. **Tail** — 20s of `journalctl -u alert-bot -f` for inspection. This currently
-   does not fail the job on a later startup error; readiness checks remain open
-   in `BACKLOG.md`.
+2. **Build** — `cargo build --release --locked --bin alert-bot` on pinned
+   `ubuntu-22.04`, then upload a one-day artifact. This job has no production
+   secrets, so project build code cannot read them.
+3. **Deploy** — after the protected `production` environment approves the job,
+   download the artifact, verify the pinned `cloudflared` binary, verify the
+   LXC host key, and stream the binary into the forced deploy command. That
+   command enforces the size and ELF format, installs atomically, restarts only
+   `alert-bot`, and requires an active unit. The deploy does not print
+   service-token details or production journals.
 
 No GitHub Release roundtrip — keeps the repo free to stay private.
 
-### Manual trigger
+### Manual redeploy
 
-The workflow has `workflow_dispatch` so you can re-deploy any commit
-from the Actions tab without pushing — useful for retrying a flaky
-deploy or re-applying after a Cloudflare config change.
+GitHub → Actions → "Build and deploy to production" → open the successful,
+post-hardening `master` run for the currently deployed commit → **Re-run all
+jobs**. This keeps the original commit and ref. Do not rerun historical deploy
+runs from before this hardening; cancel them and rotate their secrets. Use a
+revert pull request for an older version instead of rerunning an old workflow.
 
 ### Tail logs from your dev machine
 
@@ -424,17 +575,14 @@ Requires `LXC_HOST` exported in your shell, or set it once in
 
 ### Rollback
 
-Trigger the workflow on an older commit:
+Revert the faulty change through a pull request and merge the revert into
+protected `master`. The normal pipeline then builds and deploys the reviewed
+rollback.
 
-- GitHub → Actions → "Build and deploy to production" → **Run
-  workflow** → pick a branch or tag → run.
-
-That rebuilds + scp's the older commit's binary. Or build locally and
-scp manually (same one-liner as step 4 in the production setup above).
-
-Postgres data isn't touched by binary swaps, so code-only rollbacks are
-safe. Schema rollbacks need a `pg_dump` restore — keep your daily Netcup
-backups close.
+An older binary is safe only when every applied database migration is backward
+compatible with it. Never edit an applied migration: add a new migration for
+every schema change. If a rollback crosses an incompatible migration, restore a
+matching database backup as part of a planned maintenance window.
 
 ## Architecture
 

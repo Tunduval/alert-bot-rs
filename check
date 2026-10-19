@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$repo_dir"
+
+printf '%s\n' '==> Running Clippy'
+cargo clippy --workspace --all-targets --locked -- -D warnings
+
+printf '%s\n' '==> Running Rust tests'
+cargo test --workspace --locked
+
+printf '%s\n' '==> Running backup tests'
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+
+if [[ -n "${DATABASE_URL:-}" ]]; then
+  printf '%s\n' '==> Running PostgreSQL integration tests'
+  cargo test --workspace --locked -- --ignored
+else
+  printf '%s\n' '==> Skipping PostgreSQL integration tests (DATABASE_URL is not set)'
+fi
+
+printf '%s\n' '==> All checks passed'

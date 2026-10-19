@@ -23,23 +23,23 @@
   // dependency ranges deliberately low (which is what a library like clap does).
   rangeStrategy: "bump",
 
-  // Refresh Cargo.lock weekly even when no manifest range changes — pulls in
-  // patched transitive crates between our own commits. Auto-merged on green.
+  // Refresh Cargo.lock weekly even when no manifest range changes. Dependency
+  // code executes during the build, so every lock-file change needs review.
   lockFileMaintenance: {
     enabled: true,
     schedule: ["on monday"],
-    automerge: true,
+    automerge: false,
   },
 
   packageRules: [
     // --- Cargo: minor + patch --------------------------------------------
-    // One grouped PR; auto-merges once CI is green. A merge to master triggers
-    // the LXC deploy, so this is continuous deployment: green CI -> prod.
+    // One grouped PR. A merge to master creates the production artifact, so a
+    // human must review even non-major dependency changes.
     {
       matchManagers: ["cargo"],
       matchUpdateTypes: ["minor", "patch"],
       groupName: "cargo (minor & patch)",
-      automerge: true,
+      automerge: false,
     },
 
     // --- Cargo: major ----------------------------------------------------
@@ -80,13 +80,12 @@
     },
 
     // --- GitHub Actions --------------------------------------------------
-    // Low-risk, grouped, auto-merged (digests kept fresh by the helper above).
-    // Majors need a human: an auto-merged major once moved the runner and the
-    // CI Postgres image without review.
+    // Actions execute inside CI and the deploy job receives production
+    // credentials. Digest updates are grouped but never auto-merged.
     {
       matchManagers: ["github-actions"],
       groupName: "github actions",
-      automerge: true,
+      automerge: false,
     },
     {
       matchManagers: ["github-actions"],
