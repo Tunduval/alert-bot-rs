@@ -326,6 +326,9 @@ if '--quote' in args:
 
     def test_restore_verifies_signature_before_touching_database(self):
         readme = README.read_text()
+        migration = readme.split("#### 6. Migrate data", 1)[1].split(
+            "#### 7. Cloudflare", 1
+        )[0]
         restore = readme.split("### Restoring from backup", 1)[1].split(
             "## Update workflow", 1
         )[0]
@@ -335,6 +338,10 @@ if '--quote' in args:
         self.assertNotIn("psql", restore)
         self.assertIn("--max-filesize", restore)
         self.assertIn("--hostpubsha256", restore)
+        self.assertIn('--dbname=alertbot < "$migration"', migration)
+        self.assertIn('--dbname=alertbot < "$backup"', restore)
+        self.assertNotIn('--dbname=alertbot "$migration"', migration)
+        self.assertNotIn('--dbname=alertbot "$backup"', restore)
         self.assertIn("Never restore an unsigned dump", restore)
 
 

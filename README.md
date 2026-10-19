@@ -288,7 +288,7 @@ cleanup_migration() {
 trap cleanup_migration EXIT
 sudo -u alertbot pg_restore --exit-on-error --single-transaction \
     --clean --if-exists --no-owner --no-privileges \
-    --dbname=alertbot "$migration"
+    --dbname=alertbot < "$migration"
 sudo -u alertbot psql -d alertbot \
     -c "SELECT count(*), max(created_at) FROM alerts;"
 cleanup_migration
@@ -558,7 +558,7 @@ systemctl stop alert-bot
 bot_stopped=1
 sudo -u alertbot pg_restore \
   --exit-on-error --single-transaction --clean --if-exists \
-  --no-owner --no-privileges --dbname=alertbot "$backup"
+  --no-owner --no-privileges --dbname=alertbot < "$backup"
 systemctl start alert-bot
 bot_stopped=0
 cleanup_restore
@@ -569,9 +569,10 @@ Never restore an unsigned dump. Never use a public key downloaded beside the
 dump. Only the pinned local public key proves that the backup host did not
 replace the archive. `pg_restore --clean --if-exists` drops and recreates the
 backed-up objects. It runs as the narrowly privileged application owner, not as
-the PostgreSQL superuser. First preserve any current data you still need. A
-failed restore leaves the bot stopped so it cannot use a partially restored
-database.
+the PostgreSQL superuser. The root shell opens the verified, root-only archive
+and passes it through standard input, so the database user never needs access
+to `/root`. First preserve any current data you still need. A failed restore
+leaves the bot stopped so it cannot use a partially restored database.
 
 ## Update workflow (CI/CD)
 
