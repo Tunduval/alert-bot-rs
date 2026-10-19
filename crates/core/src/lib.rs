@@ -174,10 +174,9 @@ pub struct Alert {
 impl Alert {
     /// Permission check for edit/delete operations.
     ///
-    /// `Private` alerts are owned by the creator. `Shared` alerts can be
-    /// modified by anyone — Telegram guarantees that messages in a group's
-    /// `chat_id` come from a member of that chat, so we don't need an
-    /// explicit membership check.
+    /// `Private` alerts are owned by the creator. `Shared` alerts permit any
+    /// requester after the caller has established the relevant chat context.
+    /// This method does not itself prove current Telegram membership.
     pub fn can_edit(&self, requester_user_id: i64) -> bool {
         match self.scope {
             AlertScope::Private => self.user_id == requester_user_id,

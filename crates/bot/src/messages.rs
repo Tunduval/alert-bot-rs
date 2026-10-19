@@ -14,8 +14,14 @@ pub fn command_menu(lang: Language) -> Vec<(&'static str, &'static str)> {
         Language::De => vec![
             ("start", "begrüßt dich und richtet dein Profil ein"),
             ("help", "zeigt alle Befehle und Beispiele"),
-            ("alert", "Reminder — nur du kannst ihn löschen (DM und Gruppen)"),
-            ("galert", "Gruppen-Reminder — jeder im Chat kann ihn löschen"),
+            (
+                "alert",
+                "Reminder — nur du kannst ihn löschen (DM und Gruppen)",
+            ),
+            (
+                "galert",
+                "Gruppen-Reminder — jeder im Chat kann ihn löschen",
+            ),
             ("list", "listet aktive Reminder im aktuellen Chat"),
             ("cancel", "löscht einen Reminder per ID"),
             ("tz", "setzt deine Zeitzone, z.B. Europe/Berlin"),
@@ -24,8 +30,14 @@ pub fn command_menu(lang: Language) -> Vec<(&'static str, &'static str)> {
         Language::En => vec![
             ("start", "say hi and set up your profile"),
             ("help", "show all commands and examples"),
-            ("alert", "reminder — only you can cancel it (DMs and groups)"),
-            ("galert", "group reminder — anyone in the chat can cancel it"),
+            (
+                "alert",
+                "reminder — only you can cancel it (DMs and groups)",
+            ),
+            (
+                "galert",
+                "group reminder — anyone in the chat can cancel it",
+            ),
             ("list", "show active reminders in the current chat"),
             ("cancel", "delete a reminder by id"),
             ("tz", "set your timezone, e.g. Europe/Berlin"),
@@ -36,26 +48,31 @@ pub fn command_menu(lang: Language) -> Vec<(&'static str, &'static str)> {
 
 pub fn welcome(lang: Language) -> &'static str {
     match lang {
-        Language::De => "Hi! Ich bin dein Alert-Bot. Schick mir z.B.\n\
+        Language::De => {
+            "Hi! Ich bin dein Alert-Bot. Schick mir z.B.\n\
             /alert 5m Kaffee fertig\n\
             /alert 30.4.26 Steuererklärung\n\
             /alert do 14:00 Standup\n\n\
             In Gruppen funktionieren beide: /alert für deine eigenen Reminder, \
             /galert wenn ihn jeder verwalten können soll.\n\
-            /help zeigt alle Befehle.",
-        Language::En => "Hi! I'm your alert bot. Try messages like\n\
+            /help zeigt alle Befehle."
+        }
+        Language::En => {
+            "Hi! I'm your alert bot. Try messages like\n\
             /alert 5m coffee ready\n\
             /alert 30.4.26 file taxes\n\
             /alert thu 14:00 standup\n\n\
             Both work in groups: /alert for your own reminders, /galert when \
             anyone in the chat should be able to manage it.\n\
-            /help lists every command.",
+            /help lists every command."
+        }
     }
 }
 
 pub fn help(lang: Language) -> &'static str {
     match lang {
-        Language::De => "<b>Befehle</b>\n\
+        Language::De => {
+            "<b>Befehle</b>\n\
             /alert &lt;zeit&gt; &lt;text&gt; — Reminder. Nur du kannst ihn löschen.\n\
             /galert &lt;zeit&gt; &lt;text&gt; — Gruppen-Reminder. Jeder im Chat kann löschen.\n\
             /list — aktive Reminder anzeigen\n\
@@ -111,8 +128,10 @@ pub fn help(lang: Language) -> &'static str {
             • <b>m</b> = Minuten, <b>M</b> = Monate (Groß/klein zählt!)\n\
             • Tippfehler werden korrigiert: donnerstah → Donnerstag\n\
             • Mindestintervall 30 Min, Max einmalig 50 Jahre\n\
-            • <i>heute</i>/<i>today</i> ist absichtlich raus — nimm direkt die Uhrzeit",
-        Language::En => "<b>Commands</b>\n\
+            • <i>heute</i>/<i>today</i> ist absichtlich raus — nimm direkt die Uhrzeit"
+        }
+        Language::En => {
+            "<b>Commands</b>\n\
             /alert &lt;time&gt; &lt;text&gt; — reminder. Only you can cancel it.\n\
             /galert &lt;time&gt; &lt;text&gt; — group reminder. Anyone in the chat can cancel.\n\
             /list — show active reminders\n\
@@ -167,7 +186,8 @@ pub fn help(lang: Language) -> &'static str {
             • <b>m</b> = minutes, <b>M</b> = months (case matters!)\n\
             • Typos are auto-corrected: thurzday → Thursday\n\
             • Minimum interval 30 min, max one-shot offset 50 years\n\
-            • <i>today</i>/<i>heute</i> is deliberately rejected — use the clock time directly",
+            • <i>today</i>/<i>heute</i> is deliberately rejected — use the clock time directly"
+        }
     }
 }
 
@@ -200,9 +220,7 @@ pub fn galert_confirmation(
         Language::En => ("Saved", "by"),
     };
     match recurrence_short {
-        Some(rec) => format!(
-            "👥 {verb} · #{id} 🔁 · {when_short} · {rec} · {by} {creator_handle}"
-        ),
+        Some(rec) => format!("👥 {verb} · #{id} 🔁 · {when_short} · {rec} · {by} {creator_handle}"),
         None => format!("👥 {verb} · #{id} · {when_short} · {by} {creator_handle}"),
     }
 }
@@ -255,6 +273,13 @@ pub fn snooze_gone(lang: Language) -> &'static str {
     }
 }
 
+pub fn snooze_already_created(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Dieser Reminder wurde bereits verschoben.",
+        Language::En => "This reminder was already snoozed.",
+    }
+}
+
 pub fn snooze_invalid_offset(lang: Language) -> &'static str {
     match lang {
         Language::De => "Bitte wähle +5min, +15min oder +1h.",
@@ -299,6 +324,17 @@ pub fn chat_quota_exceeded(lang: Language, current: i64, max: i64) -> String {
         ),
         Language::En => format!(
             "This chat already has {current} active reminders (limit {max}). /list shows them."
+        ),
+    }
+}
+
+pub fn user_chat_quota_exceeded(lang: Language, current: i64, max: i64) -> String {
+    match lang {
+        Language::De => format!(
+            "Du hast in diesem Chat {current} aktive Reminder (Limit {max}). Lösch erst einen eigenen Reminder."
+        ),
+        Language::En => format!(
+            "You have {current} active reminders in this chat (limit {max}). Cancel one of yours first."
         ),
     }
 }
@@ -357,8 +393,12 @@ pub fn parse_error_missing_text(lang: Language) -> &'static str {
 
 pub fn parse_error_heute_rejected(lang: Language) -> &'static str {
     match lang {
-        Language::De => "„heute“ verstehe ich nicht — schreib direkt die Uhrzeit, z.B. /alert 22:00 Bier.",
-        Language::En => "I don’t take „today“ — just use the time directly, e.g. /alert 22:00 beer.",
+        Language::De => {
+            "„heute“ verstehe ich nicht — schreib direkt die Uhrzeit, z.B. /alert 22:00 Bier."
+        }
+        Language::En => {
+            "I don’t take „today“ — just use the time directly, e.g. /alert 22:00 beer."
+        }
     }
 }
 
@@ -391,10 +431,22 @@ pub fn parse_note(note: ParseNote, lang: Language) -> String {
         (ParseNote::LeapClampedToFeb28 { new_year }, Language::En) => {
             format!("Note: Feb 29 → Feb 28 in {new_year} (not a leap year).")
         }
-        (ParseNote::MonthDayClamped { before_day, after_day }, Language::De) => format!(
+        (
+            ParseNote::MonthDayClamped {
+                before_day,
+                after_day,
+            },
+            Language::De,
+        ) => format!(
             "Hinweis: Tag {before_day} gibt es im Zielmonat nicht — angepasst auf {after_day}."
         ),
-        (ParseNote::MonthDayClamped { before_day, after_day }, Language::En) => format!(
+        (
+            ParseNote::MonthDayClamped {
+                before_day,
+                after_day,
+            },
+            Language::En,
+        ) => format!(
             "Note: day {before_day} doesn't exist in the target month — clamped to {after_day}."
         ),
         (ParseNote::MonthlyLastDay, Language::De) => {
@@ -421,8 +473,8 @@ pub fn list_empty(lang: Language) -> &'static str {
 
 pub fn list_header(lang: Language) -> &'static str {
     match lang {
-        Language::De => "<b>Aktive Reminder</b>",
-        Language::En => "<b>Active reminders</b>",
+        Language::De => "Aktive Reminder",
+        Language::En => "Active reminders",
     }
 }
 

@@ -12,12 +12,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgListener;
+use sqlx::postgres::{PgListener, PgNotification};
 use teloxide::prelude::*;
 use teloxide::ApiError;
-use tokio_util::sync::CancellationToken;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use botcore::{Alert, Language};
@@ -60,7 +61,8 @@ pub async fn run(bot: Bot, store: Arc<PgStore>, shutdown: CancellationToken) -> 
                 info!("worker shutting down");
                 return Ok(());
             }
-            _ = listener.recv() => {
+            notification = listener.recv() => {
+                require_notification(notification)?;
                 debug!("worker woke on NOTIFY");
             }
             _ = sleep_until(next_wake) => {
@@ -74,8 +76,14 @@ pub async fn run(bot: Bot, store: Arc<PgStore>, shutdown: CancellationToken) -> 
     }
 }
 
+fn require_notification(notification: Result<PgNotification, sqlx::Error>) -> anyhow::Result<()> {
+    notification
+        .map(|_| ())
+        .context("receiving alerts_changed notification")
+}
+
 async fn process_due(bot: &Bot, store: &PgStore) -> anyhow::Result<()> {
-    let claimed = store.claim_due_alerts(CLAIM_BATCH).await?;
+    let claimed = store.claim_due_alerts(CLAIM_BATCH, MAX_ATTEMPTS).await?;
     for alert in claimed {
         deliver(bot, store, alert).await;
     }
@@ -115,12 +123,52 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
         .await;
 
     match send {
-        Ok(_) => {
+        Ok(message) => {
+            match store
+                .record_alert_delivery(
+                    alert.id,
+                    alert.claim_generation,
+                    alert.chat_id,
+                    i64::from(message.id.0),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    id = alert.id,
+                    generation = alert.claim_generation,
+                    "delivery has no snooze receipt; callback will fail closed"
+                ),
+                Err(e) => error!(
+                    id = alert.id,
+                    generation = alert.claim_generation,
+                    error = ?e,
+                    "record_alert_delivery failed; callback will fail closed"
+                ),
+            }
             if let Err(e) = finalise_after_send(store, &alert).await {
                 error!(id = alert.id, error = ?e, "finalise_after_send failed");
             }
         }
         Err(teloxide::RequestError::RetryAfter(seconds)) => {
+            if !retry_allowed(alert.attempts) {
+                warn!(
+                    id = alert.id,
+                    attempts = alert.attempts,
+                    "giving up after repeated telegram 429 responses"
+                );
+                if let Err(e) = store
+                    .mark_failed(
+                        alert.id,
+                        alert.claim_generation,
+                        "max attempts: telegram rate limit",
+                    )
+                    .await
+                {
+                    error!(id = alert.id, error = ?e, "mark_failed failed");
+                }
+                return;
+            }
             // Telegram global/group rate limit. Reschedule and retry.
             let new_fire = Utc::now() + chrono::Duration::seconds(seconds.seconds() as i64 + 1);
             warn!(
@@ -153,7 +201,7 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
         }
         Err(e) => {
             // Transient — retry with exponential backoff up to MAX_ATTEMPTS.
-            if alert.attempts >= MAX_ATTEMPTS {
+            if !retry_allowed(alert.attempts) {
                 let msg = format!("max attempts: {e}");
                 warn!(id = alert.id, attempts = alert.attempts, "giving up");
                 if let Err(e) = store
@@ -180,6 +228,10 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
             }
         }
     }
+}
+
+fn retry_allowed(attempts: i16) -> bool {
+    attempts < MAX_ATTEMPTS
 }
 
 /// On successful delivery: if recurring, compute the next fire time relative
@@ -256,6 +308,21 @@ mod tests {
     use botcore::{AlertScope, AlertState, ChatType, NewAlert, Schedule};
     use sqlx::{ConnectOptions, PgPool};
     use tokio::sync::Notify;
+
+    #[test]
+    fn every_retry_class_stops_at_max_attempts() {
+        assert!(retry_allowed(MAX_ATTEMPTS - 1));
+        assert!(!retry_allowed(MAX_ATTEMPTS));
+        assert!(!retry_allowed(i16::MAX));
+    }
+
+    #[test]
+    fn listener_errors_stop_the_worker_instead_of_spinning() {
+        let error = require_notification(Err(sqlx::Error::PoolClosed)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("receiving alerts_changed notification"));
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
     #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]

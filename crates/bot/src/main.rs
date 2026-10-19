@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use teloxide::dispatching::ShutdownToken;
-use teloxide::update_listeners::webhooks;
 use teloxide::prelude::*;
-use teloxide::types::BotCommand;
+use teloxide::types::{BotCommand, UpdateKind};
+use teloxide::update_listeners::webhooks;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -81,10 +81,21 @@ async fn main() -> Result<()> {
     let rate_limiter = Arc::new(CommandRateLimiter::new());
 
     let handler = dptree::entry()
-        // Telegram retries webhook deliveries on timeout — drop duplicates by
-        // update_id. Errors are logged and we fall through (better to risk a
-        // duplicate than to silently swallow the update).
-        .filter_async(|update: Update, store: Arc<PgStore>| async move {
+        // Reject unsupported update kinds and exhausted users before the
+        // persistent deduplication write. Otherwise edited/channel updates or
+        // a command flood can grow processed_updates without reaching a
+        // rate-limited handler.
+        .filter_async(|update: Update, store: Arc<PgStore>, limiter: Arc<CommandRateLimiter>| async move {
+            let Some(user_id) = ingress_user_id(&update) else {
+                return false;
+            };
+            if !limiter.check(user_id) {
+                return false;
+            }
+
+            // Telegram retries webhook deliveries on timeout. Drop duplicates
+            // by update_id. On a deduplication error, continue rather than
+            // silently losing an otherwise valid update.
             match store.try_register_update(update.id.0 as i64).await {
                 Ok(fresh) => fresh,
                 Err(e) => {
@@ -106,6 +117,10 @@ async fn main() -> Result<()> {
     // and feeds the dispatcher's ShutdownToken on either.
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
         .dependencies(dptree::deps![store.clone(), rate_limiter.clone()])
+        // Root filters intentionally drop unsupported and rate-limited input.
+        // Teloxide's default handler logs the complete Debug update, including
+        // user text, which would turn a rejected flood into journal egress.
+        .default_handler(|_| async {})
         .build();
 
     spawn_signal_handler(
@@ -154,6 +169,16 @@ async fn main() -> Result<()> {
     }
     notifier.notify("🛑 alert-bot stopped").await;
     result
+}
+
+fn ingress_user_id(update: &Update) -> Option<i64> {
+    match &update.kind {
+        UpdateKind::Message(message) if message.sender_chat.is_none() => {
+            message.from.as_ref().map(|user| user.id.0 as i64)
+        }
+        UpdateKind::CallbackQuery(query) => Some(query.from.id.0 as i64),
+        _ => None,
+    }
 }
 
 /// Observe the worker while dispatching. A dead delivery task must fail the
@@ -213,7 +238,11 @@ enum Transport {
 impl std::fmt::Debug for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Transport::Webhook { listen, url, secret } => f
+            Transport::Webhook {
+                listen,
+                url,
+                secret,
+            } => f
                 .debug_struct("Webhook")
                 .field("listen", listen)
                 .field("url", &url.as_str())
@@ -237,12 +266,21 @@ impl Config {
                     .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
                     .parse()
                     .context("WEBHOOK_LISTEN is not a valid socket address")?;
-                let secret = std::env::var("WEBHOOK_SECRET").ok().filter(|s| !s.is_empty());
-                Transport::Webhook { listen, url, secret }
+                let secret = std::env::var("WEBHOOK_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                Transport::Webhook {
+                    listen,
+                    url,
+                    secret,
+                }
             }
         };
 
-        let admin_chat_id = match std::env::var("ADMIN_CHAT_ID").ok().filter(|s| !s.is_empty()) {
+        let admin_chat_id = match std::env::var("ADMIN_CHAT_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
             None => None,
             Some(s) => Some(
                 s.parse::<i64>()

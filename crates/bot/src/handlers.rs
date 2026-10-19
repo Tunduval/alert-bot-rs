@@ -6,44 +6,33 @@ use chrono::Utc;
 use chrono_tz::Tz;
 use teloxide::prelude::*;
 use teloxide::types::{
-    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode,
-    PublicChatKind, Recipient,
+    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+    ParseMode, PublicChatKind, Recipient,
 };
 
-use botcore::{AlertScope, ChatType, Language, NewAlert, Schedule};
+use botcore::{AlertScope, ChatType, Language, NewAlert};
 use parser::ParseContext;
-use storage::PgStore;
+use storage::{AlertLimits, CreateAlertOutcome, CreateSnoozeOutcome, PgStore};
 
 use crate::commands::Command;
-use crate::limits::{self, CommandRateLimiter};
+use crate::limits;
 use crate::messages as m;
 use crate::render;
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-pub async fn dispatch(
-    bot: Bot,
-    msg: Message,
-    cmd: Command,
-    store: Arc<PgStore>,
-    limiter: Arc<CommandRateLimiter>,
-) -> HandlerResult {
-    let user_id = match msg.from.as_ref() {
-        Some(u) => u.id.0 as i64,
-        None => return Ok(()), // anonymous channel posts: ignore
-    };
-    let detected_lang = Language::from_telegram_code(
-        msg.from.as_ref().and_then(|u| u.language_code.as_deref()),
-    );
-
-    // Rate-limit before touching the DB. A spammer who blew past their
-    // per-minute budget shouldn't get free upsert_user calls.
-    if !limiter.check(user_id) {
-        bot.send_message(msg.chat.id, m::rate_limited(detected_lang))
-            .await
-            .ok();
+pub async fn dispatch(bot: Bot, msg: Message, cmd: Command, store: Arc<PgStore>) -> HandlerResult {
+    // Telegram supplies a compatibility-only fake `from` user when a message
+    // is sent on behalf of a chat (including anonymous group administrators).
+    // It is not a person identity and must never own a private alert.
+    let Some(user_id) = trusted_sender_id(
+        msg.from.as_ref().map(|user| user.id.0 as i64),
+        msg.sender_chat.is_some(),
+    ) else {
         return Ok(());
-    }
+    };
+    let detected_lang =
+        Language::from_telegram_code(msg.from.as_ref().and_then(|u| u.language_code.as_deref()));
 
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -63,6 +52,14 @@ pub async fn dispatch(
     }
 
     Ok(())
+}
+
+fn trusted_sender_id(from_id: Option<i64>, has_sender_chat: bool) -> Option<i64> {
+    if has_sender_chat {
+        None
+    } else {
+        from_id
+    }
 }
 
 async fn start(bot: Bot, msg: Message, lang: Language) -> HandlerResult {
@@ -106,9 +103,7 @@ async fn create_alert(
                 parser::ParseError::SubDayRelWithOverride => {
                     m::parse_error_subday_override(user.language).to_string()
                 }
-                parser::ParseError::RelTooFar(y) => {
-                    m::parse_error_rel_too_far(user.language, y)
-                }
+                parser::ParseError::RelTooFar(y) => m::parse_error_rel_too_far(user.language, y),
                 parser::ParseError::InvalidRelSpec => {
                     m::parse_error_invalid_rel_spec(user.language).to_string()
                 }
@@ -131,25 +126,6 @@ async fn create_alert(
         .await?;
         return Ok(());
     }
-    let user_count = store.count_active_for_user(user.telegram_id).await?;
-    if user_count >= limits::MAX_ALERTS_PER_USER {
-        bot.send_message(
-            msg.chat.id,
-            m::user_quota_exceeded(user.language, user_count, limits::MAX_ALERTS_PER_USER),
-        )
-        .await?;
-        return Ok(());
-    }
-    let chat_count = store.count_active_for_chat(msg.chat.id.0).await?;
-    if chat_count >= limits::MAX_ALERTS_PER_CHAT {
-        bot.send_message(
-            msg.chat.id,
-            m::chat_quota_exceeded(user.language, chat_count, limits::MAX_ALERTS_PER_CHAT),
-        )
-        .await?;
-        return Ok(());
-    }
-
     let chat_type = chat_type_from_msg(msg);
     let new = NewAlert {
         user_id: user.telegram_id,
@@ -160,13 +136,22 @@ async fn create_alert(
         fire_at: parsed.fire_at(),
         schedule: parsed.schedule.clone(),
     };
-    let alert = store.create_alert(new).await?;
+    let alert = match store.create_alert_with_limits(new, alert_limits()).await? {
+        CreateAlertOutcome::Created(alert) => alert,
+        outcome => {
+            bot.send_message(msg.chat.id, quota_message(user.language, outcome))
+                .await?;
+            return Ok(());
+        }
+    };
 
     let when = render::format_local_short(alert.fire_at, user.timezone, user.language);
     let recurrence_short = render::format_recurrence_short(&alert.schedule, user.language);
     let recurrence_str = recurrence_short.as_deref();
     let mut reply = match scope {
-        AlertScope::Private => m::alert_confirmation(user.language, &when, alert.id, recurrence_str),
+        AlertScope::Private => {
+            m::alert_confirmation(user.language, &when, alert.id, recurrence_str)
+        }
         AlertScope::Shared => {
             let handle = msg
                 .from
@@ -210,12 +195,13 @@ fn action_keyboard(lang: Language, id: i64) -> InlineKeyboardMarkup {
 /// Inline keyboard attached to each *delivered* reminder. Always three snooze
 /// buttons; an extra ✗ Serie beenden appears only for recurring alerts, so
 /// users can kill the whole series without typing `/cancel`.
-pub fn delivery_keyboard(lang: Language, alert_id: i64, is_recurring: bool) -> InlineKeyboardMarkup {
+pub fn delivery_keyboard(
+    lang: Language,
+    alert_id: i64,
+    is_recurring: bool,
+) -> InlineKeyboardMarkup {
     let mut row = vec![
-        InlineKeyboardButton::callback(
-            m::button_snooze_5m(lang),
-            format!("snooze:300:{alert_id}"),
-        ),
+        InlineKeyboardButton::callback(m::button_snooze_5m(lang), format!("snooze:300:{alert_id}")),
         InlineKeyboardButton::callback(
             m::button_snooze_15m(lang),
             format!("snooze:900:{alert_id}"),
@@ -251,13 +237,7 @@ async fn galert(
     create_alert(bot, msg, store, user, AlertScope::Shared, text).await
 }
 
-async fn list(
-    bot: &Bot,
-    msg: &Message,
-    store: &PgStore,
-    lang: Language,
-    tz: Tz,
-) -> HandlerResult {
+async fn list(bot: &Bot, msg: &Message, store: &PgStore, lang: Language, tz: Tz) -> HandlerResult {
     let alerts = store.list_active_for_chat(msg.chat.id.0).await?;
     if alerts.is_empty() {
         bot.send_message(msg.chat.id, m::list_empty(lang))
@@ -266,27 +246,47 @@ async fn list(
         return Ok(());
     }
 
-    let mut out = String::from(m::list_header(lang));
-    out.push('\n');
+    let mut lines = Vec::with_capacity(alerts.len());
     for a in &alerts {
         let scope_icon = match a.scope {
             AlertScope::Private => "🔒",
             AlertScope::Shared => "👥",
         };
         let when = render::format_local_compact(a.fire_at, tz, lang);
-        let text = html_escape(&a.text);
-        let line = match render::format_recurrence_short(&a.schedule, lang) {
+        let text = truncate_chars(&a.text, limits::MAX_TEXT_LEN);
+        let raw_line = match render::format_recurrence_short(&a.schedule, lang) {
             Some(rec_short) => {
-                format!("\n{scope_icon}🔁 #{} · {when} · {rec_short} · {text}", a.id)
+                format!("{scope_icon}🔁 #{} · {when} · {rec_short} · {text}", a.id)
             }
-            None => format!("\n{scope_icon} #{} · {when} · {text}", a.id),
+            None => format!("{scope_icon} #{} · {when} · {text}", a.id),
         };
-        out.push_str(&line);
+        lines.push(ListLine {
+            visible_len: telegram_text_len(&raw_line),
+            html: html_escape(&raw_line),
+            raw: raw_line,
+        });
     }
 
-    bot.send_message(msg.chat.id, out)
-        .parse_mode(ParseMode::Html)
+    let pages = paginate_list(m::list_header(lang), &lines, 4000);
+    if pages.len() == 1 {
+        bot.send_message(msg.chat.id, &pages[0].html)
+            .parse_mode(ParseMode::Html)
+            .await?;
+    } else {
+        // Large lists would fan one inbound command out into many Telegram API
+        // calls and can trip the chat-wide send limit. A single text document
+        // keeps every line without creating an attacker-controlled egress fanout.
+        let mut document = String::from(m::list_header(lang));
+        for line in &lines {
+            document.push('\n');
+            document.push_str(&line.raw);
+        }
+        bot.send_document(
+            msg.chat.id,
+            InputFile::memory(document.into_bytes()).file_name("alerts.txt"),
+        )
         .await?;
+    }
     Ok(())
 }
 
@@ -299,16 +299,19 @@ async fn cancel(
     id: i64,
 ) -> HandlerResult {
     let Some(alert) = store.get_alert(id).await? else {
-        bot.send_message(msg.chat.id, m::cancel_not_found(lang)).await?;
+        bot.send_message(msg.chat.id, m::cancel_not_found(lang))
+            .await?;
         return Ok(());
     };
     if alert.chat_id != msg.chat.id.0 {
         // Don't reveal alerts from other chats.
-        bot.send_message(msg.chat.id, m::cancel_not_found(lang)).await?;
+        bot.send_message(msg.chat.id, m::cancel_not_found(lang))
+            .await?;
         return Ok(());
     }
     if !alert.can_edit(requester) {
-        bot.send_message(msg.chat.id, m::cancel_not_allowed(lang)).await?;
+        bot.send_message(msg.chat.id, m::cancel_not_allowed(lang))
+            .await?;
         return Ok(());
     }
     let ok = store.cancel_alert(id, requester).await?;
@@ -334,7 +337,8 @@ async fn set_tz(
     match parsed {
         Ok(tz) => {
             store.set_timezone(user_id, tz).await?;
-            bot.send_message(msg.chat.id, m::tz_set(lang, tz.name())).await?;
+            bot.send_message(msg.chat.id, m::tz_set(lang, tz.name()))
+                .await?;
         }
         Err(_) => {
             bot.send_message(msg.chat.id, m::tz_invalid(lang))
@@ -396,21 +400,9 @@ pub async fn callback_dispatch(
     bot: Bot,
     query: CallbackQuery,
     store: Arc<PgStore>,
-    limiter: Arc<CommandRateLimiter>,
 ) -> HandlerResult {
     let user_id = query.from.id.0 as i64;
     let detected_lang = Language::from_telegram_code(query.from.language_code.as_deref());
-
-    // Callbacks count against the same per-user budget as commands —
-    // otherwise a scripted client could spam +5m on every button forever.
-    if !limiter.check(user_id) {
-        bot.answer_callback_query(query.id.clone())
-            .text(m::rate_limited(detected_lang))
-            .show_alert(false)
-            .await
-            .ok();
-        return Ok(());
-    }
 
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -537,44 +529,60 @@ async fn handle_snooze_callback(
         return Ok(());
     };
 
-    // Snooze creates a new alert, so it counts against both quotas the same
-    // way as a fresh /alert command would. The errors get rendered as a
-    // callback toast (no separate chat message) since the user is mid-tap.
-    let user_count = store.count_active_for_user(user.telegram_id).await?;
-    if user_count >= limits::MAX_ALERTS_PER_USER {
+    if !can_snooze(&original, user.telegram_id) {
         bot.answer_callback_query(query.id.clone())
-            .text(m::user_quota_exceeded(
-                user.language,
-                user_count,
-                limits::MAX_ALERTS_PER_USER,
-            ))
-            .show_alert(true)
-            .await?;
-        return Ok(());
-    }
-    let chat_count = store.count_active_for_chat(original.chat_id).await?;
-    if chat_count >= limits::MAX_ALERTS_PER_CHAT {
-        bot.answer_callback_query(query.id.clone())
-            .text(m::chat_quota_exceeded(
-                user.language,
-                chat_count,
-                limits::MAX_ALERTS_PER_CHAT,
-            ))
+            .text(m::cancel_not_allowed(user.language))
             .show_alert(true)
             .await?;
         return Ok(());
     }
 
-    let new = NewAlert {
-        user_id: user.telegram_id,
-        chat_id: original.chat_id,
-        chat_type: original.chat_type.clone(),
-        scope: AlertScope::Private,
-        text: original.text.clone(),
-        fire_at,
-        schedule: Schedule::one_shot(fire_at, original.schedule.tz),
+    let Some(origin_message) = query.message.as_ref() else {
+        bot.answer_callback_query(query.id.clone())
+            .text(m::snooze_gone(user.language))
+            .await?;
+        return Ok(());
     };
-    let created = store.create_alert(new).await?;
+    let created = match store
+        .create_snooze_with_limits(
+            alert_id,
+            user.telegram_id,
+            origin_message.chat().id.0,
+            i64::from(origin_message.id().0),
+            fire_at,
+            alert_limits(),
+        )
+        .await?
+    {
+        CreateSnoozeOutcome::Created(alert) => alert,
+        CreateSnoozeOutcome::Duplicate => {
+            clear_inline_buttons(bot, query).await;
+            bot.answer_callback_query(query.id.clone())
+                .text(m::snooze_already_created(user.language))
+                .await?;
+            return Ok(());
+        }
+        CreateSnoozeOutcome::SourceGone => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::snooze_gone(user.language))
+                .await?;
+            return Ok(());
+        }
+        CreateSnoozeOutcome::NotAllowed => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::cancel_not_allowed(user.language))
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+        outcome => {
+            bot.answer_callback_query(query.id.clone())
+                .text(snooze_quota_message(user.language, outcome))
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+    };
 
     // Strip the buttons off the originally-delivered message so the user
     // can't double-tap +5m and stack snoozes. The freshly-created one-shot
@@ -587,10 +595,17 @@ async fn handle_snooze_callback(
         .as_ref()
         .map(|m| m.chat().id)
         .unwrap_or(ChatId(original.chat_id));
-    bot.send_message(chat_id_for_reply, m::snooze_confirmation(user.language, &when))
-        .await?;
+    bot.send_message(
+        chat_id_for_reply,
+        m::snooze_confirmation(user.language, &when),
+    )
+    .await?;
     bot.answer_callback_query(query.id.clone()).await?;
     Ok(())
+}
+
+fn can_snooze(alert: &botcore::Alert, requester_user_id: i64) -> bool {
+    alert.can_edit(requester_user_id)
 }
 
 /// Callback data is untrusted, even when the originating chat is valid.
@@ -704,6 +719,92 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn alert_limits() -> AlertLimits {
+    AlertLimits {
+        max_per_user: limits::MAX_ALERTS_PER_USER,
+        max_per_chat: limits::MAX_ALERTS_PER_CHAT,
+        max_per_user_chat: limits::MAX_ALERTS_PER_USER_CHAT,
+    }
+}
+
+fn quota_message(lang: Language, outcome: CreateAlertOutcome) -> String {
+    match outcome {
+        CreateAlertOutcome::Created(_) => unreachable!("created alerts have no quota message"),
+        CreateAlertOutcome::UserQuota { current } => {
+            m::user_quota_exceeded(lang, current, limits::MAX_ALERTS_PER_USER)
+        }
+        CreateAlertOutcome::ChatQuota { current } => {
+            m::chat_quota_exceeded(lang, current, limits::MAX_ALERTS_PER_CHAT)
+        }
+        CreateAlertOutcome::UserChatQuota { current } => {
+            m::user_chat_quota_exceeded(lang, current, limits::MAX_ALERTS_PER_USER_CHAT)
+        }
+    }
+}
+
+fn snooze_quota_message(lang: Language, outcome: CreateSnoozeOutcome) -> String {
+    match outcome {
+        CreateSnoozeOutcome::UserQuota { current } => {
+            m::user_quota_exceeded(lang, current, limits::MAX_ALERTS_PER_USER)
+        }
+        CreateSnoozeOutcome::ChatQuota { current } => {
+            m::chat_quota_exceeded(lang, current, limits::MAX_ALERTS_PER_CHAT)
+        }
+        CreateSnoozeOutcome::UserChatQuota { current } => {
+            m::user_chat_quota_exceeded(lang, current, limits::MAX_ALERTS_PER_USER_CHAT)
+        }
+        _ => unreachable!("non-quota snooze outcomes have dedicated handling"),
+    }
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+#[derive(Debug)]
+struct ListLine {
+    html: String,
+    raw: String,
+    visible_len: usize,
+}
+
+#[derive(Debug)]
+struct ListPage {
+    html: String,
+    visible_len: usize,
+}
+
+fn paginate_list(header: &str, lines: &[ListLine], max_chars: usize) -> Vec<ListPage> {
+    let mut pages = Vec::new();
+    let header_html = format!("<b>{}</b>", html_escape(header));
+    let header_len = telegram_text_len(header);
+    let mut page = ListPage {
+        html: header_html.clone(),
+        visible_len: header_len,
+    };
+    for line in lines {
+        let added = 1 + line.visible_len;
+        if page.visible_len + added > max_chars && page.visible_len != header_len {
+            pages.push(page);
+            page = ListPage {
+                html: header_html.clone(),
+                visible_len: header_len,
+            };
+        }
+        page.html.push('\n');
+        page.html.push_str(&line.html);
+        page.visible_len += added;
+    }
+    if page.visible_len != header_len || lines.is_empty() {
+        pages.push(page);
+    }
+    pages
+}
+
+fn telegram_text_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,7 +817,10 @@ mod tests {
             assert_eq!(snooze_fire_at(offset, now), None, "offset {offset}");
         }
         for offset in [300, 900, 3600] {
-            assert_eq!(snooze_fire_at(offset, now), Some(now + chrono::Duration::seconds(offset)));
+            assert_eq!(
+                snooze_fire_at(offset, now),
+                Some(now + chrono::Duration::seconds(offset))
+            );
         }
         assert_eq!(snooze_fire_at(300, chrono::DateTime::<Utc>::MAX_UTC), None);
     }
@@ -745,5 +849,96 @@ mod tests {
         let row = &kb.inline_keyboard[0];
         assert_eq!(row.len(), 4);
         assert_eq!(callback_data(&row[3]), "stop_series:7");
+    }
+
+    #[test]
+    fn list_pages_stay_below_telegram_limit_and_keep_lines_whole() {
+        let lines: Vec<ListLine> = (0..50)
+            .map(|i| {
+                let raw = format!("#{i} {}", "&".repeat(500));
+                ListLine {
+                    visible_len: telegram_text_len(&raw),
+                    html: html_escape(&raw),
+                    raw,
+                }
+            })
+            .collect();
+        let pages = paginate_list("Header", &lines, 4000);
+        assert!(pages.len() > 1);
+        assert!(
+            pages.len() <= 8,
+            "escaped entities must not amplify page count"
+        );
+        assert!(pages.iter().all(|page| page.visible_len <= 4000));
+        for line in &lines {
+            assert_eq!(
+                pages
+                    .iter()
+                    .filter(|page| page.html.contains(&line.html))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_happens_before_html_expansion() {
+        let raw = format!("{}tail", "&".repeat(limits::MAX_TEXT_LEN));
+        let escaped = html_escape(&truncate_chars(&raw, limits::MAX_TEXT_LEN));
+        assert_eq!(escaped, "&amp;".repeat(limits::MAX_TEXT_LEN));
+    }
+
+    #[test]
+    fn list_limit_counts_non_bmp_characters_as_telegram_does() {
+        let raw_lines = ["🔒".repeat(1_999), "last".into()];
+        let lines: Vec<ListLine> = raw_lines
+            .iter()
+            .map(|raw| ListLine {
+                html: html_escape(raw),
+                raw: raw.to_string(),
+                visible_len: telegram_text_len(raw),
+            })
+            .collect();
+        let pages = paginate_list("h", &lines, 4000);
+        assert_eq!(pages.len(), 2);
+        assert!(pages.iter().all(|page| page.visible_len <= 4000));
+    }
+
+    #[test]
+    fn private_snooze_is_restricted_to_the_owner() {
+        let now = Utc::now();
+        let alert = botcore::Alert {
+            id: 1,
+            user_id: 42,
+            chat_id: -100,
+            chat_type: ChatType::Group,
+            scope: AlertScope::Private,
+            text: "secret".into(),
+            fire_at: now,
+            schedule: botcore::Schedule::one_shot(now, chrono_tz::UTC),
+            state: botcore::AlertState::Sent,
+            attempts: 1,
+            last_error: None,
+            claimed_at: None,
+            claim_generation: 1,
+            fired_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(can_snooze(&alert, 42));
+        assert!(!can_snooze(&alert, 7));
+
+        let shared = botcore::Alert {
+            scope: AlertScope::Shared,
+            ..alert
+        };
+        assert!(can_snooze(&shared, 7));
+    }
+
+    #[test]
+    fn chat_backed_messages_never_become_private_alert_owners() {
+        assert_eq!(trusted_sender_id(Some(42), false), Some(42));
+        assert_eq!(trusted_sender_id(None, false), None);
+        assert_eq!(trusted_sender_id(Some(1_087_968_824), true), None);
     }
 }

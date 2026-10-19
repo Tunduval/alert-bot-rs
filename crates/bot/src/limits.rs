@@ -25,6 +25,10 @@ pub const MAX_ALERTS_PER_USER: i64 = 100;
 /// Defends against "bot added to hostile group, someone spams /galert".
 pub const MAX_ALERTS_PER_CHAT: i64 = 50;
 
+/// Maximum active alerts one user may pin to one chat. This prevents one
+/// group member from consuming the entire chat-wide quota.
+pub const MAX_ALERTS_PER_USER_CHAT: i64 = 10;
+
 /// Commands accepted per Telegram user per minute. Bucket starts full so a
 /// user can send 6 commands instantly (e.g. setting up several reminders
 /// in one sitting), then trickles at one command every 10s.
@@ -35,8 +39,8 @@ const COMMANDS_PER_MINUTE: u32 = 6;
 
 pub type UserId = i64;
 
-/// In-memory keyed token-bucket limiter. Lives in an `Arc` shared between
-/// the message dispatcher and the callback dispatcher.
+/// In-memory keyed token-bucket limiter. The dispatcher applies it once to
+/// supported message and callback updates before any persistent DB write.
 ///
 /// Restart resets the limiter (it's in-memory by design). That's acceptable
 /// — abusers usually move on once the first attempt is throttled, and the
