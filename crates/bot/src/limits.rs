@@ -5,14 +5,14 @@
 //! removing the bot from a hostile group); they just keep the DB bounded and
 //! the worker responsive when a single client sends a burst.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::num::NonZeroU32;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use governor::clock::DefaultClock;
 use governor::state::keyed::DashMapStateStore;
-use governor::{Quota, RateLimiter};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 
 /// Maximum reminder-text length in characters. Telegram's own message limit
 /// is 4096, but real reminders almost never need more than ~80; anything
@@ -40,6 +40,12 @@ pub const MAX_ALERTS_PER_USER_CHAT: i64 = 10;
 /// headroom for bulk-setup bursts; a spammer hits the wall immediately.
 const COMMANDS_PER_MINUTE: u32 = 6;
 
+/// Commands accepted across all Telegram users per minute after their
+/// individual check passed. This caps persistent work after a webhook-secret
+/// compromise without letting one exhausted user consume everyone else's
+/// budget.
+const GLOBAL_COMMANDS_PER_MINUTE: u32 = 120;
+
 /// Maximum user identities retained by the in-memory limiter. A forged
 /// webhook update cannot allocate state beyond this fixed ceiling.
 const MAX_TRACKED_USERS: usize = 4_096;
@@ -59,14 +65,17 @@ pub type UserId = i64;
 /// soft DB quotas catch persistent ones across restarts.
 pub struct CommandRateLimiter {
     limiter: RateLimiter<UserId, DashMapStateStore<UserId>, DefaultClock>,
+    global_limiter: DefaultDirectRateLimiter,
     tracked_users: Mutex<HashMap<UserId, Instant>>,
 }
 
 impl CommandRateLimiter {
     pub fn new() -> Self {
         let quota = Quota::per_minute(NonZeroU32::new(COMMANDS_PER_MINUTE).unwrap());
+        let global_quota = Quota::per_minute(NonZeroU32::new(GLOBAL_COMMANDS_PER_MINUTE).unwrap());
         Self {
             limiter: RateLimiter::dashmap(quota),
+            global_limiter: RateLimiter::direct(global_quota),
             tracked_users: Mutex::new(HashMap::new()),
         }
     }
@@ -80,22 +89,26 @@ impl CommandRateLimiter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if let Some(last_seen) = tracked.get_mut(&user_id) {
-            *last_seen = now;
-            return self.limiter.check_key(&user_id).is_ok();
-        }
-
         if tracked.len() >= MAX_TRACKED_USERS {
             self.limiter.retain_recent();
             self.limiter.shrink_to_fit();
             tracked.retain(|_, last_seen| now.duration_since(*last_seen) < TRACKED_USER_TTL);
         }
-        if tracked.len() >= MAX_TRACKED_USERS {
+        let has_capacity = tracked.len() < MAX_TRACKED_USERS;
+        match tracked.entry(user_id) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) if has_capacity => {
+                entry.insert(now);
+            }
+            Entry::Vacant(_) => return false,
+        }
+
+        if self.limiter.check_key(&user_id).is_err() || self.global_limiter.check().is_err() {
             return false;
         }
 
         tracked.insert(user_id, now);
-        self.limiter.check_key(&user_id).is_ok()
+        true
     }
 }
 
@@ -154,7 +167,7 @@ mod tests {
     fn rate_limiter_has_a_hard_identity_ceiling() {
         let l = CommandRateLimiter::new();
         for user_id in 0..MAX_TRACKED_USERS {
-            assert!(l.check(user_id as i64), "identity within ceiling");
+            let _ = l.check(user_id as i64);
         }
 
         assert!(!l.check(MAX_TRACKED_USERS as i64));
@@ -163,5 +176,14 @@ mod tests {
             MAX_TRACKED_USERS,
             "blocked user ID must not allocate keyed limiter state"
         );
+    }
+
+    #[test]
+    fn fresh_identities_share_a_bounded_persistent_work_budget() {
+        let l = CommandRateLimiter::new();
+        for user_id in 0..GLOBAL_COMMANDS_PER_MINUTE {
+            assert!(l.check(i64::from(user_id)), "global burst within quota");
+        }
+        assert!(!l.check(i64::from(GLOBAL_COMMANDS_PER_MINUTE)));
     }
 }
