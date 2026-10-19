@@ -7,7 +7,7 @@ set -euo pipefail
 container_runtime=${CONTAINER_RUNTIME:-podman}
 repo=$(git rev-parse --show-toplevel)
 
-"$container_runtime" run --rm --user 0 \
+"$container_runtime" run --rm --interactive --user 0 \
     --volume "$repo:/repo:ro" \
     "$DEPLOY_TEST_IMAGE" /bin/bash -s <<'CONTAINER'
 set -euo pipefail
