@@ -9,7 +9,7 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 
 use botcore::{Alert, AlertScope, AlertState, ChatType, Language, NewAlert, Schedule, User};
@@ -29,6 +29,35 @@ pub enum StorageError {
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+fn quota_lock_keys(user_id: i64, chat_id: i64) -> (i64, Option<i64>) {
+    if user_id == chat_id {
+        (user_id, None)
+    } else if user_id < chat_id {
+        (user_id, Some(chat_id))
+    } else {
+        (chat_id, Some(user_id))
+    }
+}
+
+async fn lock_alert_quota_keys(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: i64,
+    chat_id: i64,
+) -> Result<()> {
+    let (first, second) = quota_lock_keys(user_id, chat_id);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(first)
+        .execute(&mut **tx)
+        .await?;
+    if let Some(second) = second {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(second)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct AlertLimits {
@@ -180,25 +209,15 @@ impl PgStore {
     /// Create an alert only if all active-alert quotas still have room.
     ///
     /// The transaction-scoped advisory locks serialize creators for the same
-    /// user and chat. Telegram user ids are positive and group chat ids are
-    /// negative; direct-message ids are identical and advisory locks are
-    /// re-entrant. Taking the user lock first therefore avoids lock cycles.
+    /// user and chat. Always taking the numerically smaller key first prevents
+    /// lock cycles even when two requests use the same ids in opposite roles.
     pub async fn create_alert_with_limits(
         &self,
         new: NewAlert,
         limits: AlertLimits,
     ) -> Result<CreateAlertOutcome> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(new.user_id)
-            .execute(&mut *tx)
-            .await?;
-        if new.chat_id != new.user_id {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(new.chat_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        lock_alert_quota_keys(&mut tx, new.user_id, new.chat_id).await?;
 
         let user_count: (i64,) = sqlx::query_as(
             "SELECT count(*) FROM alerts WHERE user_id = $1 AND state IN ('pending', 'claimed')",
@@ -354,16 +373,7 @@ impl PgStore {
             return Ok(CreateSnoozeOutcome::NotAllowed);
         }
 
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(requester_user_id)
-            .execute(&mut *tx)
-            .await?;
-        if source.chat_id != requester_user_id {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(source.chat_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        lock_alert_quota_keys(&mut tx, requester_user_id, source.chat_id).await?;
 
         let user_count: (i64,) = sqlx::query_as(
             "SELECT count(*) FROM alerts WHERE user_id = $1 AND state IN ('pending', 'claimed')",
@@ -805,6 +815,41 @@ fn row_to_alert(row: PgRow) -> Result<Alert> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_lock_order_is_canonical_across_id_roles() {
+        assert_eq!(quota_lock_keys(-100, 42), (-100, Some(42)));
+        assert_eq!(quota_lock_keys(42, -100), (-100, Some(42)));
+        assert_eq!(quota_lock_keys(42, 42), (42, None));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn opposite_user_chat_pairs_do_not_deadlock(pool: PgPool) {
+        let mut first = pool.begin().await.unwrap();
+        let mut second = pool.begin().await.unwrap();
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let first_start = start.clone();
+        let second_start = start;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            tokio::join!(
+                async move {
+                    first_start.wait().await;
+                    lock_alert_quota_keys(&mut first, -100, 42).await.unwrap();
+                    first.commit().await.unwrap();
+                },
+                async move {
+                    second_start.wait().await;
+                    lock_alert_quota_keys(&mut second, 42, -100).await.unwrap();
+                    second.commit().await.unwrap();
+                }
+            );
+        })
+        .await;
+
+        assert!(result.is_ok(), "opposite id roles must not deadlock");
+    }
 
     async fn due_alert(store: &PgStore, text: &str) -> Alert {
         store.upsert_user(42, Language::De).await.unwrap();

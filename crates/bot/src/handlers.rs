@@ -15,6 +15,7 @@ use parser::ParseContext;
 use storage::{AlertLimits, CreateAlertOutcome, CreateSnoozeOutcome, PgStore};
 
 use crate::commands::Command;
+use crate::identity;
 use crate::limits;
 use crate::messages as m;
 use crate::render;
@@ -26,7 +27,7 @@ pub async fn dispatch(bot: Bot, msg: Message, cmd: Command, store: Arc<PgStore>)
     // is sent on behalf of a chat (including anonymous group administrators).
     // It is not a person identity and must never own a private alert.
     let Some(user_id) = trusted_sender_id(
-        msg.from.as_ref().map(|user| user.id.0 as i64),
+        msg.from.as_ref().map(|user| user.id.0),
         msg.sender_chat.is_some(),
     ) else {
         return Ok(());
@@ -54,11 +55,11 @@ pub async fn dispatch(bot: Bot, msg: Message, cmd: Command, store: Arc<PgStore>)
     Ok(())
 }
 
-fn trusted_sender_id(from_id: Option<i64>, has_sender_chat: bool) -> Option<i64> {
+fn trusted_sender_id(from_id: Option<u64>, has_sender_chat: bool) -> Option<i64> {
     if has_sender_chat {
         None
     } else {
-        from_id
+        from_id.and_then(identity::user_id)
     }
 }
 
@@ -401,7 +402,9 @@ pub async fn callback_dispatch(
     query: CallbackQuery,
     store: Arc<PgStore>,
 ) -> HandlerResult {
-    let user_id = query.from.id.0 as i64;
+    let Some(user_id) = identity::user_id(query.from.id.0) else {
+        return Ok(());
+    };
     let detected_lang = Language::from_telegram_code(query.from.language_code.as_deref());
 
     let user = store.upsert_user(user_id, detected_lang).await?;
@@ -411,7 +414,7 @@ pub async fn callback_dispatch(
     match parts.as_slice() {
         ["cancel", id_str] => {
             if let Ok(id) = id_str.parse::<i64>() {
-                handle_cancel_callback(&bot, &store, &query, user.language, id).await?;
+                handle_cancel_callback(&bot, &store, &query, user_id, user.language, id).await?;
             } else {
                 bot.answer_callback_query(query.id.clone()).await?;
             }
@@ -428,7 +431,8 @@ pub async fn callback_dispatch(
         }
         ["stop_series", id_str] => {
             if let Ok(id) = id_str.parse::<i64>() {
-                handle_stop_series_callback(&bot, &store, &query, user.language, id).await?;
+                handle_stop_series_callback(&bot, &store, &query, user_id, user.language, id)
+                    .await?;
             } else {
                 bot.answer_callback_query(query.id.clone()).await?;
             }
@@ -469,6 +473,7 @@ async fn handle_cancel_callback(
     bot: &Bot,
     store: &PgStore,
     query: &CallbackQuery,
+    requester: i64,
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
@@ -482,7 +487,6 @@ async fn handle_cancel_callback(
             .await?;
         return Ok(());
     }
-    let requester = query.from.id.0 as i64;
     let ok = store.cancel_alert(alert_id, requester).await?;
 
     if ok {
@@ -623,6 +627,7 @@ async fn handle_stop_series_callback(
     bot: &Bot,
     store: &PgStore,
     query: &CallbackQuery,
+    requester: i64,
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
@@ -636,7 +641,6 @@ async fn handle_stop_series_callback(
             .await?;
         return Ok(());
     }
-    let requester = query.from.id.0 as i64;
     let ok = store.cancel_alert(alert_id, requester).await?;
     if ok {
         // Strip buttons first — the series is gone, so the +5m / Serie beenden
@@ -688,7 +692,9 @@ pub async fn handle_unhandled(bot: Bot, msg: Message, store: Arc<PgStore>) -> Ha
     let Some(from) = msg.from.as_ref() else {
         return Ok(());
     };
-    let user_id = from.id.0 as i64;
+    let Some(user_id) = identity::user_id(from.id.0) else {
+        return Ok(());
+    };
     let detected_lang = Language::from_telegram_code(from.language_code.as_deref());
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -940,5 +946,6 @@ mod tests {
         assert_eq!(trusted_sender_id(Some(42), false), Some(42));
         assert_eq!(trusted_sender_id(None, false), None);
         assert_eq!(trusted_sender_id(Some(1_087_968_824), true), None);
+        assert_eq!(trusted_sender_id(Some(i64::MAX as u64 + 1), false), None);
     }
 }

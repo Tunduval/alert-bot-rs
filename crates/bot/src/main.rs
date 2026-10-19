@@ -16,6 +16,7 @@ use storage::PgStore;
 mod admin;
 mod commands;
 mod handlers;
+mod identity;
 mod limits;
 mod messages;
 mod render;
@@ -177,10 +178,11 @@ async fn main() -> Result<()> {
 
 fn ingress_user_id(update: &Update) -> Option<i64> {
     match &update.kind {
-        UpdateKind::Message(message) if message.sender_chat.is_none() => {
-            message.from.as_ref().map(|user| user.id.0 as i64)
-        }
-        UpdateKind::CallbackQuery(query) => Some(query.from.id.0 as i64),
+        UpdateKind::Message(message) if message.sender_chat.is_none() => message
+            .from
+            .as_ref()
+            .and_then(|user| identity::user_id(user.id.0)),
+        UpdateKind::CallbackQuery(query) => identity::user_id(query.from.id.0),
         _ => None,
     }
 }
