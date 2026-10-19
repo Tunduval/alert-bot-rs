@@ -46,6 +46,9 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
 - **Group reminders with two scopes**
   - `/alert` in a group fires in the group, but only the creator can cancel it.
   - `/galert` is a shared group reminder; anyone in the chat can cancel.
+  - The bot must be a group administrator to verify shared-reminder callback
+    users reliably with Telegram's `getChatMember` API. Failed checks deny the
+    cancellation and leave the reminder unchanged.
   - Commands sent as an anonymous administrator or on behalf of a chat are
     ignored because Telegram does not provide a trustworthy user identity.
 - **Delivery controls** — snooze by 5 minutes, 15 minutes or 1 hour; stop a
@@ -94,7 +97,8 @@ endpoint is needed for development. Open Telegram, message your bot, send
 | `WEBHOOK_URL`        | no       | empty (long-polling)     | public HTTPS URL Telegram POSTs to                       |
 | `WEBHOOK_LISTEN`     | no       | `0.0.0.0:8080`           | bind address inside the process                          |
 | `WEBHOOK_SECRET`     | webhook  | —                        | required with `WEBHOOK_URL`; 32–256 Telegram-safe characters; verified via `X-Telegram-Bot-Api-Secret-Token` |
-| `STATS_LISTEN`       | no       | disabled                 | read-only `/stats`; use an internal address, e.g. `127.0.0.1:8081`; no endpoint authentication |
+| `STATS_LISTEN`       | no       | disabled                 | authenticated `/stats`; use an internal address, e.g. `127.0.0.1:8081` |
+| `STATS_TOKEN`        | stats    | —                        | required with `STATS_LISTEN`; 32–256 URL-safe characters; send as `Authorization: Bearer <token>` |
 | `RUST_LOG`           | no       | `info,alert_bot=debug`   |                                                          |
 
 ## Production deployment (Proxmox LXC + Cloudflare Tunnel)
@@ -104,6 +108,14 @@ fronts multiple services on the same Proxmox host; the alert-bot LXC just
 exposes `:8080` on the internal Proxmox bridge so cloudflared can reach it.
 Permit TCP port 8080 in the Proxmox firewall only from the cloudflared LXC.
 Do not expose that origin listener to the rest of the bridge or the internet.
+The origin hop carries the Telegram update and webhook secret over HTTP. Put
+both LXCs on a dedicated point-to-point network, an isolated VLAN with no other
+guest, or an encrypted overlay. A source-IP firewall blocks active peers but
+does not protect the secret from a bridge-level man-in-the-middle. Treat the
+cloudflared LXC as part of the bot's security boundary.
+
+Bind `STATS_LISTEN` to loopback unless an encrypted internal channel carries
+the request. The bearer token does not make cleartext LAN HTTP confidential.
 
 ```mermaid
 flowchart LR
@@ -130,9 +142,15 @@ record the exact template digest before creating the container so a rebuild
 uses the same reviewed input. Do not pipe a downloaded community script into a
 root shell.
 
-Install the required system packages from Debian's signed repositories. If the
-exact PostgreSQL 16 release is not in that Debian release, use PostgreSQL's
-official signed APT repository. Keep the container minimal (2 CPU / 2 GB /
+Install the required system packages from Debian's signed repositories. Use at
+least PostgreSQL 16.15, 17.11, or 18.6 for both server and client. The bot
+refuses older and unreviewed server versions. If the required release is not in
+that Debian release, use PostgreSQL's official signed APT repository. These
+floors close the server-side RCEs
+[CVE-2026-14680](https://www.postgresql.org/support/security/CVE-2026-14680/)
+and [CVE-2026-2004](https://www.postgresql.org/support/security/CVE-2026-2004/).
+An ordinary database user or object creator can otherwise execute code as the
+PostgreSQL operating-system user. Keep the container minimal (2 CPU / 2 GB /
 8 GB disk is enough for a small instance), enable automatic security updates,
 and record the LXC's internal IP. Confirm that local PostgreSQL connections use
 peer authentication before continuing.
@@ -300,6 +318,11 @@ trap - EXIT
 The GitHub Actions workflow connects to the LXC over Cloudflare Access
 SSH — no SSH port needs to be exposed on the LXC.
 
+Permit TCP port 22 on the internal bridge only from the cloudflared LXC and an
+explicit management source. After bootstrap, verify `sshd -T`, disable password
+authentication and direct root login, and remove the old unrestricted root
+deploy key.
+
 Create an unprivileged account that exists only to enter the root-owned deploy
 receiver. The clean `env -i` boundary is inside the exact `sudoers` command, so
 SSH environment variables can never reach a root shell or interpreter.
@@ -442,8 +465,24 @@ deployment via Cloudflare Access. There is no GitHub Release step.
 
 #### 8. Nightly off-site backup → Netcup SFTP
 
+Generate the `age` identity on a separate trusted offline system:
+
 ```bash
-apt install -y curl openssl sshpass postgresql-client
+umask 077
+age-keygen -o alertbot-backup.agekey
+age-keygen -y alertbot-backup.agekey > alertbot-backup-recipient.txt
+```
+
+Store `alertbot-backup.agekey` offline. Copy only the single `age1...`
+recipient from `alertbot-backup-recipient.txt` into
+`BACKUP_AGE_RECIPIENT` below. The identity must never reside on the production
+LXC.
+
+Configure the production LXC:
+
+```bash
+apt install -y age curl openssl sshpass postgresql-client-16
+pg_dump --version  # must report at least 16.15
 
 # Keep backup credentials outside the bot's Unix identity.
 useradd --system --no-create-home --shell /usr/sbin/nologin alertbot-backup
@@ -483,33 +522,51 @@ BACKUP_NETCUP_PASS=<sftp password>
 BACKUP_NETCUP_PATH=backups/alertbot
 BACKUP_KNOWN_HOSTS=/etc/alertbot-backup-known-hosts
 BACKUP_SFTP_HOSTKEY_SHA256=${host_key_sha256#SHA256:}
+BACKUP_AGE_RECIPIENT=<age1 recipient generated offline>
 RETENTION_DAYS=30
 EOF
 unset host_key_sha256
 
 # Keep the private signing key root-only. systemd exposes it only to the
-# dedicated backup service through LoadCredential.
+# dedicated backup service through LoadCredential. Keep the public verification
+# key under the separate restore trust path.
 umask 077
 install -o root -g root -m 0700 -d /etc/alertbot-backup
+install -o root -g root -m 0755 -d /etc/alertbot-restore
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
   -out /etc/alertbot-backup/signing-private.pem
 openssl pkey -in /etc/alertbot-backup/signing-private.pem -pubout \
-  -out /etc/alertbot-backup/signing-public.pem
-chown root:root /etc/alertbot-backup/signing-*.pem
+  -out /etc/alertbot-restore/signing-public.pem
+chown root:root /etc/alertbot-backup/signing-private.pem \
+  /etc/alertbot-restore/signing-public.pem
 chmod 0600 /etc/alertbot-backup/signing-private.pem
-chmod 0644 /etc/alertbot-backup/signing-public.pem
+chmod 0644 /etc/alertbot-restore/signing-public.pem
 
 systemctl daemon-reload
 systemctl enable --now alertbot-backup.timer
 systemctl start alertbot-backup.service        # test now
 journalctl -u alertbot-backup -n 30
+systemctl is-failed --quiet alertbot-backup.service && exit 1
 ```
 
 Daily from 03:30 UTC, with up to 15 minutes randomized delay, the timer creates
-a PostgreSQL custom-format dump. The script signs its SHA-256 hash with RSA. It
-uploads the dump and detached signature as `.part` files. Separate renames
-publish the signature first and the dump last. The script prunes matching
-`.dump` and `.dump.sig` files after `RETENTION_DAYS`.
+a PostgreSQL custom-format dump in a service-private, mode-0700 temporary
+directory. It encrypts the dump with `age` and deletes the plaintext
+immediately. The script creates a
+manifest for the encrypted `.dump.age` file. The manifest binds the format
+version, database, canonical file name, UTC creation time, ciphertext byte
+size, and SHA-256 hash. It signs that manifest with RSA. It uploads only the
+ciphertext, manifest, and detached signature as `.part` files. Separate renames
+publish the signature, manifest, and ciphertext in that order. The script
+limits a retention listing to 60 seconds and 1 MiB. It prunes every matching
+backup part after `RETENTION_DAYS`.
+
+The backup host must provide `pg_dump` 16.15 or newer in major 16, 17.11 or
+newer in major 17, or 18.6 or newer in major 18. The script rejects older and
+unknown major versions before it reads the database. These floors contain the
+official fix for
+[CVE-2026-19385](https://www.postgresql.org/support/security/CVE-2026-19385/),
+which otherwise lets a crafted database object execute code in `pg_dump`.
 
 The unit runs as `alertbot-backup`. PostgreSQL peer authentication maps that
 Unix account to the matching database role. That role has only `CONNECT`,
@@ -522,57 +579,115 @@ the SFTP environment file or private signing key.
 ```bash
 set -euo pipefail
 restore_dir=$(mktemp -d /root/alertbot-restore.XXXXXX)
-bot_stopped=0
+identity_mount=/media/alertbot-age
 cleanup_restore() {
-    rm -rf -- "$restore_dir"
-    if (( bot_stopped )); then
-        systemctl start alert-bot
+    local cleanup_status=$?
+    if mountpoint -q "$identity_mount"; then
+        umount "$identity_mount" || true
     fi
+    rm -rf -- "$restore_dir" || true
+    return "$cleanup_status"
 }
 trap cleanup_restore EXIT
-backup="$restore_dir/alertbot.dump"
-signature="$backup.sig"
+backup_name=alertbot-2026-05-09T033000Z.dump.age
+[[ "$backup_name" =~ ^alertbot-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z\.dump\.age$ ]]
+ciphertext="$restore_dir/$backup_name"
+backup="$restore_dir/${backup_name%.age}"
+manifest="$ciphertext.manifest"
+signature="$manifest.sig"
 host_key_sha256=$(sed -n \
   's/^BACKUP_SFTP_HOSTKEY_SHA256=//p' /etc/alertbot-backup.env)
 [[ "$host_key_sha256" =~ ^[A-Za-z0-9+/]{43}$ ]]
 
 read -r -p 'SFTP user: ' BACKUP_NETCUP_USER
 curl --fail --show-error --silent \
-    --connect-timeout 15 --max-time 1800 --max-filesize 1073741824 \
+    --connect-timeout 15 --max-time 60 --max-filesize 4096 \
     --user "$BACKUP_NETCUP_USER" \
     --hostpubsha256 "$host_key_sha256" \
-    --output "$backup" \
-    "sftp://your-netcup-host/backups/alertbot/alertbot-2026-05-09T033000Z.dump"
+    --output "$manifest" \
+    "sftp://your-netcup-host/backups/alertbot/$backup_name.manifest"
 curl --fail --show-error --silent \
     --connect-timeout 15 --max-time 60 --max-filesize 16384 \
     --user "$BACKUP_NETCUP_USER" \
     --hostpubsha256 "$host_key_sha256" \
     --output "$signature" \
-    "sftp://your-netcup-host/backups/alertbot/alertbot-2026-05-09T033000Z.dump.sig"
+    "sftp://your-netcup-host/backups/alertbot/$backup_name.manifest.sig"
 
-# Abort before stopping the bot if either file is missing or manipulated.
-openssl dgst -sha256 -verify /etc/alertbot-backup/signing-public.pem \
-  -signature "$signature" "$backup"
+# Trust metadata only after the pinned restore key verifies its signature.
+openssl dgst -sha256 -verify /etc/alertbot-restore/signing-public.pem \
+  -signature "$signature" "$manifest"
+mapfile -t metadata < "$manifest"
+(( ${#metadata[@]} == 6 ))
+[[ "${metadata[0]}" == "format_version=2" ]]
+[[ "${metadata[1]}" == database=* ]]
+[[ "${metadata[2]}" == filename=* ]]
+[[ "${metadata[3]}" == created_at=* ]]
+[[ "${metadata[4]}" == size_bytes=* ]]
+[[ "${metadata[5]}" == sha256=* ]]
+manifest_database=${metadata[1]#database=}
+manifest_filename=${metadata[2]#filename=}
+manifest_created_at=${metadata[3]#created_at=}
+manifest_size=${metadata[4]#size_bytes=}
+manifest_sha256=${metadata[5]#sha256=}
+[[ "$manifest_database" == alertbot ]]
+[[ "$manifest_filename" == "$backup_name" ]]
+[[ "$manifest_created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z$ ]]
+[[ "$manifest_filename" == "alertbot-${manifest_created_at}.dump.age" ]]
+[[ "$manifest_size" =~ ^[0-9]+$ ]] && (( manifest_size <= 1073741824 ))
+[[ "$manifest_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+curl --fail --show-error --silent \
+    --connect-timeout 15 --max-time 1800 --max-filesize 1073741824 \
+    --user "$BACKUP_NETCUP_USER" \
+    --hostpubsha256 "$host_key_sha256" \
+    --output "$ciphertext" \
+    "sftp://your-netcup-host/backups/alertbot/$backup_name"
+actual_size=$(stat -c %s "$ciphertext")
+actual_sha256=$(sha256sum "$ciphertext")
+actual_sha256=${actual_sha256%% *}
+[[ "$actual_size" == "$manifest_size" ]]
+[[ "$actual_sha256" == "$manifest_sha256" ]]
+
+# Attach the offline identity on read-only removable media only for this step.
+age_identity="$identity_mount/alertbot-backup.agekey"
+mountpoint -q "$identity_mount"
+findmnt -no OPTIONS "$identity_mount" | tr ',' '\n' | grep -qx ro
+[[ -r "$age_identity" ]]
+age --decrypt --identity "$age_identity" --output "$backup" "$ciphertext"
+unset age_identity
+umount "$identity_mount"
+# Remove the media before you continue. A failed decrypt exits before this
+# point, so it cannot stop the bot or touch the database.
+read -r -p 'Offline identity media removed? [y/N] ' media_removed
+[[ "$media_removed" == y ]]
+unset media_removed
 
 systemctl stop alert-bot
-bot_stopped=1
 sudo -u alertbot pg_restore \
   --exit-on-error --single-transaction --clean --if-exists \
   --no-owner --no-privileges --dbname=alertbot < "$backup"
 systemctl start alert-bot
-bot_stopped=0
 cleanup_restore
 trap - EXIT
 ```
 
-Never restore an unsigned dump. Never use a public key downloaded beside the
-dump. Only the pinned local public key proves that the backup host did not
-replace the archive. `pg_restore --clean --if-exists` drops and recreates the
-backed-up objects. It runs as the narrowly privileged application owner, not as
-the PostgreSQL superuser. The root shell opens the verified, root-only archive
-and passes it through standard input, so the database user never needs access
-to `/root`. First preserve any current data you still need. A failed restore
-leaves the bot stopped so it cannot use a partially restored database.
+Never restore a dump without its signed manifest. Never use a public key
+downloaded beside the backup. Only the pinned key under `/etc/alertbot-restore`
+authenticates the manifest. Its file name, database, byte size, and hash checks
+reject renamed or manipulated ciphertext before decryption. `age` decrypts the
+verified ciphertext into the root-only temporary directory before the bot
+stops. A failed signature, hash check, or decryption leaves the database and bot
+untouched. Keep the `age` identity offline. Attach its read-only removable media
+only for a manual restore, unmount it immediately after decryption, and never
+copy it onto the production LXC.
+
+`pg_restore --clean --if-exists` drops and recreates the backed-up objects. It
+runs as the narrowly privileged application owner, not as the PostgreSQL
+superuser. The root shell opens the verified, root-only archive and passes it
+through standard input, so the database user never needs access to `/root`.
+First preserve any current data you still need. If the restore fails after the
+bot stops, the cleanup trap removes the downloaded files and leaves the bot
+stopped. Check the database state before you start it again.
 
 ## Update workflow (CI/CD)
 
@@ -660,6 +775,12 @@ compatible with it. Never edit an applied migration: add a new migration for
 every schema change. If a rollback crosses an incompatible migration, restore a
 matching database backup as part of a planned maintenance window.
 
+Migrations 0006 and 0007 are not compatible with a binary from before this
+hardening branch. Such a binary rejects the newer migration history and does
+not understand delivery receipts or the `sending` state. Roll back with a
+matching pre-migration backup or a reviewed compatibility build, never by
+copying an old binary over the current database.
+
 ## Architecture
 
 ```
@@ -670,22 +791,33 @@ crates/
 └── bot/       teloxide command handlers, callback queries, delivery worker
 ```
 
+- **HTTP boundary** accepts at most 64 simultaneous TCP connections. It allows
+  five seconds, 32 fields, and an 8 KiB buffer for request headers. Webhook and
+  stats use the same bounded server, so an unauthenticated Slowloris client
+  cannot consume the process's 256 file descriptors indefinitely.
 - **Webhook** verifies the Telegram secret before reading the body. It accepts
   at most 64 KiB within five seconds and queues at most 128 updates. A full
   queue returns HTTP 429 so Telegram applies backpressure. Invalid or future
   update types are discarded without logging their raw payload. Sixteen fixed
   dispatcher shards with eight queued updates each prevent attacker-selected
   chat IDs from creating an unbounded number of Teloxide workers.
+- **Stats** requires its own bearer token before database access. Four queries
+  can run concurrently, each for at most two seconds. Every response disables
+  caching.
 - **Worker** sleeps until the earliest pending alert's `fire_at` or until
   Postgres `NOTIFY alerts_changed` wakes it. Claimed alerts cycle
-  `pending → claimed → sent`. Each worker claims one alert at a time; every
-  claim increments `claim_generation` (migration 0005). Completion/retry writes
-  require the same generation and claimed state, fencing out old workers.
+  `pending → claimed → sending → sent`. Each worker claims one alert at a time;
+  every claim increments `claim_generation` (migration 0005). A row-locked
+  compare-and-set decides whether cancellation or external delivery starts.
+  Completion and retry writes require the same generation and `sending` state,
+  which fences out old workers.
   Transient failures are rescheduled with
   exponential backoff, permanent ones (`BotBlocked`, `ChatNotFound`,
   `UserDeactivated`) are marked `failed`.
-- **Reaper** unsticks claims left behind by crashed workers (default 60s
-  timeout) and purges old `processed_updates` rows.
+- **Reaper** unsticks `claimed` and `sending` rows left by crashed workers
+  (default 60s timeout) and purges old `processed_updates` rows. Retrying a
+  stale `sending` row preserves availability but can duplicate a message when
+  Telegram accepted the first request before the crash.
 - **Task lifecycle** — cancellation is retained while tasks are busy. A normal
   shutdown lets the worker finish its current delivery; unexpected worker exit
   fails the process so `Restart=on-failure` can restart it.

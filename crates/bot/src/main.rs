@@ -14,6 +14,7 @@ use url::Url;
 use storage::PgStore;
 
 mod admin;
+mod bounded_http;
 mod commands;
 mod handlers;
 mod identity;
@@ -67,13 +68,15 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { worker::run(bot, store, shutdown).await })
     };
 
-    // Opt-in read-only stats endpoint (Homepage widget). Separate axum server
-    // on its own LAN-only port — doesn't touch the webhook listener below.
-    if let Some(addr) = config.stats_listen {
+    // Opt-in authenticated stats endpoint (Homepage widget). Its separate
+    // axum server doesn't touch the webhook listener below.
+    if let Some(stats_config) = config.stats {
         let store = store.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = stats::run(store, addr, shutdown).await {
+            if let Err(e) =
+                stats::run(store, stats_config.listen, stats_config.token, shutdown).await
+            {
                 tracing::error!(error = ?e, "stats server exited with error");
             }
         });
@@ -234,9 +237,14 @@ struct Config {
     database_url: String,
     transport: Transport,
     admin_chat_id: Option<i64>,
-    /// Optional LAN-only address for the read-only `/stats` endpoint. `None`
-    /// (env unset) means the stats server doesn't start at all.
-    stats_listen: Option<SocketAddr>,
+    /// Optional authenticated `/stats` endpoint. `None` means the stats
+    /// server doesn't start at all.
+    stats: Option<StatsConfig>,
+}
+
+struct StatsConfig {
+    listen: SocketAddr,
+    token: String,
 }
 
 enum Transport {
@@ -303,20 +311,17 @@ impl Config {
             ),
         };
 
-        let stats_listen = match std::env::var("STATS_LISTEN").ok().filter(|s| !s.is_empty()) {
-            None => None,
-            Some(s) => Some(
-                s.parse::<SocketAddr>()
-                    .context("STATS_LISTEN is not a valid socket address")?,
-            ),
-        };
+        let stats = parse_stats_config(
+            std::env::var("STATS_LISTEN").ok().filter(|s| !s.is_empty()),
+            std::env::var("STATS_TOKEN").ok(),
+        )?;
 
         Ok(Self {
             bot_token,
             database_url,
             transport,
             admin_chat_id,
-            stats_listen,
+            stats,
         })
     }
 }
@@ -333,6 +338,35 @@ fn validate_webhook_secret(secret: &str) -> Result<()> {
         "WEBHOOK_SECRET may only contain A-Z, a-z, 0-9, _ and -"
     );
     Ok(())
+}
+
+fn validate_stats_token(token: &str) -> Result<()> {
+    anyhow::ensure!(
+        (32..=256).contains(&token.len()),
+        "STATS_TOKEN must contain 32 to 256 characters"
+    );
+    anyhow::ensure!(
+        token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "STATS_TOKEN may only contain A-Z, a-z, 0-9, _ and -"
+    );
+    Ok(())
+}
+
+fn parse_stats_config(
+    listen: Option<String>,
+    token: Option<String>,
+) -> Result<Option<StatsConfig>> {
+    let Some(listen) = listen else {
+        return Ok(None);
+    };
+    let listen = listen
+        .parse::<SocketAddr>()
+        .context("STATS_LISTEN is not a valid socket address")?;
+    let token = token.context("STATS_TOKEN is required when STATS_LISTEN is set")?;
+    validate_stats_token(&token)?;
+    Ok(Some(StatsConfig { listen, token }))
 }
 
 fn init_tracing() {
@@ -520,6 +554,25 @@ mod supervision_tests {
         assert!(validate_webhook_secret("0123456789abcdef0123456789abcdef").is_ok());
         assert!(validate_webhook_secret("short").is_err());
         assert!(validate_webhook_secret("0123456789abcdef0123456789abcde!").is_err());
+    }
+
+    #[test]
+    fn stats_token_requires_safe_charset_and_minimum_length() {
+        assert!(validate_stats_token("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_stats_token("short").is_err());
+        assert!(validate_stats_token("0123456789abcdef0123456789abcde!").is_err());
+    }
+
+    #[test]
+    fn stats_listener_requires_a_strong_token() {
+        assert!(parse_stats_config(Some("0.0.0.0:8081".to_owned()), None).is_err());
+        let config = parse_stats_config(
+            Some("0.0.0.0:8081".to_owned()),
+            Some("0123456789abcdef0123456789abcdef".to_owned()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.listen, "0.0.0.0:8081".parse().unwrap());
     }
 
     #[test]

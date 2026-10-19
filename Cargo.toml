@@ -24,6 +24,8 @@ teloxide = { version = "0.17", features = ["macros"] }
 
 # Shared HTTP server for the bounded webhook and the read-only /stats endpoint.
 axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1"] }
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
 
 # HTTP client we hand to teloxide explicitly so we can set tcp_keepalive and
 # tighter pool_idle_timeout — defaults let pooled HTTPS conns to api.telegram.org

@@ -14,6 +14,8 @@ use thiserror::Error;
 
 use botcore::{Alert, AlertScope, AlertState, ChatType, Language, NewAlert, Schedule, User};
 
+mod server_version;
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
@@ -26,6 +28,8 @@ pub enum StorageError {
     InvalidLanguage(String),
     #[error("invalid enum value: {0}")]
     InvalidEnum(String),
+    #[error("unsupported PostgreSQL server version {found}; require 16.15+, 17.11+, or 18.6+")]
+    UnsupportedServerVersion { found: String },
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -85,6 +89,13 @@ pub enum CreateSnoozeOutcome {
     UserChatQuota { current: i64 },
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CancelAlertOutcome {
+    Cancelled,
+    DeliveryStarted,
+    NotCancellable,
+}
+
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
@@ -101,8 +112,27 @@ impl PgStore {
             // Recycle idle connections after 10 min so they don't outlive
             // postgres's own idle-in-transaction or NAT keepalive limits.
             .idle_timeout(std::time::Duration::from_secs(600))
+            // A local role can hold advisory locks even without table write
+            // privileges. Bound every application wait so it cannot consume
+            // the complete pool indefinitely.
+            .after_connect(|connection, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET lock_timeout = '5s'")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET statement_timeout = '30s'")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(url)
             .await?;
+        let version_num: i32 =
+            sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&pool)
+                .await?;
+        server_version::require_supported(version_num)?;
         Ok(Self { pool })
     }
 
@@ -220,7 +250,7 @@ impl PgStore {
         lock_alert_quota_keys(&mut tx, new.user_id, new.chat_id).await?;
 
         let user_count: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM alerts WHERE user_id = $1 AND state IN ('pending', 'claimed')",
+            "SELECT count(*) FROM alerts WHERE user_id = $1 AND state IN ('pending', 'claimed', 'sending')",
         )
         .bind(new.user_id)
         .fetch_one(&mut *tx)
@@ -233,7 +263,7 @@ impl PgStore {
         }
 
         let chat_count: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM alerts WHERE chat_id = $1 AND state IN ('pending', 'claimed')",
+            "SELECT count(*) FROM alerts WHERE chat_id = $1 AND state IN ('pending', 'claimed', 'sending')",
         )
         .bind(new.chat_id)
         .fetch_one(&mut *tx)
@@ -247,7 +277,7 @@ impl PgStore {
 
         let user_chat_count: (i64,) = sqlx::query_as(
             "SELECT count(*) FROM alerts
-             WHERE user_id = $1 AND chat_id = $2 AND state IN ('pending', 'claimed')",
+             WHERE user_id = $1 AND chat_id = $2 AND state IN ('pending', 'claimed', 'sending')",
         )
         .bind(new.user_id)
         .bind(new.chat_id)
@@ -290,7 +320,7 @@ impl PgStore {
 
     /// Record the Telegram message returned by a successful send.
     ///
-    /// The source must still be our live claim. A duplicate send for the same
+    /// The source must still be our live send. A duplicate send for the same
     /// claim generation deliberately gets no second receipt, so it cannot
     /// create a second snooze for that occurrence.
     pub async fn record_alert_delivery(
@@ -308,7 +338,7 @@ impl PgStore {
             SELECT $3, $4, id, claim_generation
             FROM alerts
             WHERE id = $1 AND claim_generation = $2
-              AND chat_id = $3 AND state = 'claimed'
+              AND chat_id = $3 AND state = 'sending'
             ON CONFLICT DO NOTHING
             "#,
         )
@@ -376,7 +406,7 @@ impl PgStore {
         lock_alert_quota_keys(&mut tx, requester_user_id, source.chat_id).await?;
 
         let user_count: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM alerts WHERE user_id = $1 AND state IN ('pending', 'claimed')",
+            "SELECT count(*) FROM alerts WHERE user_id = $1 AND state IN ('pending', 'claimed', 'sending')",
         )
         .bind(requester_user_id)
         .fetch_one(&mut *tx)
@@ -387,7 +417,7 @@ impl PgStore {
             });
         }
         let chat_count: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM alerts WHERE chat_id = $1 AND state IN ('pending', 'claimed')",
+            "SELECT count(*) FROM alerts WHERE chat_id = $1 AND state IN ('pending', 'claimed', 'sending')",
         )
         .bind(source.chat_id)
         .fetch_one(&mut *tx)
@@ -399,7 +429,7 @@ impl PgStore {
         }
         let user_chat_count: (i64,) = sqlx::query_as(
             "SELECT count(*) FROM alerts
-             WHERE user_id = $1 AND chat_id = $2 AND state IN ('pending', 'claimed')",
+             WHERE user_id = $1 AND chat_id = $2 AND state IN ('pending', 'claimed', 'sending')",
         )
         .bind(requester_user_id)
         .bind(source.chat_id)
@@ -474,7 +504,7 @@ impl PgStore {
                    dtstart, rrule, tz,
                    state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
             FROM alerts
-            WHERE chat_id = $1 AND state IN ('pending', 'claimed')
+            WHERE chat_id = $1 AND state IN ('pending', 'claimed', 'sending')
             ORDER BY fire_at ASC
             "#,
         )
@@ -484,29 +514,55 @@ impl PgStore {
         rows.into_iter().map(row_to_alert).collect()
     }
 
-    /// Mark `cancelled`, but only if `requester_user_id` is allowed to.
-    /// Returns `true` if a row was actually transitioned, `false` if the alert
-    /// doesn't exist, isn't active, or the requester lacks permission.
-    pub async fn cancel_alert(&self, id: i64, requester_user_id: i64) -> Result<bool> {
-        // Fetch first to enforce the can_edit predicate in Rust — keeps the
-        // permission rule colocated with the domain type and out of SQL.
-        let Some(alert) = self.get_alert(id).await? else {
-            return Ok(false);
+    /// Cancel an alert before external delivery starts.
+    ///
+    /// The row lock serialises this decision with `begin_delivery`. Once the
+    /// delivery CAS wins, callers get an honest `DeliveryStarted` result.
+    pub async fn cancel_alert(
+        &self,
+        id: i64,
+        requester_user_id: i64,
+    ) -> Result<CancelAlertOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT user_id, scope, state FROM alerts WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            return Ok(CancelAlertOutcome::NotCancellable);
         };
-        if !alert.can_edit(requester_user_id) {
-            return Ok(false);
+        let user_id: i64 = row.try_get("user_id")?;
+        let scope_value: String = row.try_get("scope")?;
+        let scope = AlertScope::parse(&scope_value)
+            .ok_or_else(|| StorageError::InvalidEnum(scope_value.clone()))?;
+        let state_value: String = row.try_get("state")?;
+        let state = AlertState::parse(&state_value)
+            .ok_or_else(|| StorageError::InvalidEnum(state_value.clone()))?;
+        let allowed = match scope {
+            AlertScope::Private => user_id == requester_user_id,
+            AlertScope::Shared => true,
+        };
+        if !allowed {
+            return Ok(CancelAlertOutcome::NotCancellable);
         }
-        if !matches!(alert.state, AlertState::Pending | AlertState::Claimed) {
-            return Ok(false);
-        }
-        let res = sqlx::query(
-            "UPDATE alerts SET state = 'cancelled', claimed_at = NULL, updated_at = now()
-             WHERE id = $1 AND state IN ('pending', 'claimed')",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() == 1)
+        let outcome = match state {
+            AlertState::Pending | AlertState::Claimed => {
+                sqlx::query(
+                    "UPDATE alerts SET state = 'cancelled', claimed_at = NULL, updated_at = now()
+                     WHERE id = $1",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+                CancelAlertOutcome::Cancelled
+            }
+            AlertState::Sending => CancelAlertOutcome::DeliveryStarted,
+            AlertState::Sent | AlertState::Failed | AlertState::Cancelled => {
+                CancelAlertOutcome::NotCancellable
+            }
+        };
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     /// Atomically claim up to `limit` due alerts. Multiple workers can call
@@ -550,13 +606,26 @@ impl PgStore {
         rows.into_iter().map(row_to_alert).collect()
     }
 
+    /// Fence cancellation immediately before starting the external send.
+    pub async fn begin_delivery(&self, id: i64, generation: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE alerts SET state = 'sending', claimed_at = now(), updated_at = now()
+             WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
+        )
+        .bind(id)
+        .bind(generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Only the current claim generation may finish or retry a delivery.
     /// State alone is insufficient: the reaper can release a claim and a new
     /// worker can claim the same row before the original worker completes.
     pub async fn mark_sent(&self, id: i64, generation: i64) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE alerts SET state = 'sent', fired_at = now(), updated_at = now()
-             WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
+             WHERE id = $1 AND state = 'sending' AND claim_generation = $2",
         )
         .bind(id)
         .bind(generation)
@@ -568,7 +637,7 @@ impl PgStore {
     pub async fn mark_failed(&self, id: i64, generation: i64, error: &str) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE alerts SET state = 'failed', last_error = $3, updated_at = now()
-             WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
+             WHERE id = $1 AND state = 'sending' AND claim_generation = $2",
         )
         .bind(id)
         .bind(generation)
@@ -589,7 +658,7 @@ impl PgStore {
     ) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE alerts SET state = 'pending', fire_at = $3, claimed_at = NULL, updated_at = now()
-             WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
+             WHERE id = $1 AND state = 'sending' AND claim_generation = $2",
         )
         .bind(id)
         .bind(generation)
@@ -613,7 +682,7 @@ impl PgStore {
         let res = sqlx::query(
             "UPDATE alerts SET state = 'pending', fire_at = $3, claimed_at = NULL,
                                attempts = 0, updated_at = now()
-             WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
+             WHERE id = $1 AND state = 'sending' AND claim_generation = $2",
         )
         .bind(id)
         .bind(generation)
@@ -623,14 +692,16 @@ impl PgStore {
         Ok(res.rows_affected() == 1)
     }
 
-    /// Reaper: rows stuck in `claimed` longer than the timeout were owned by
-    /// a worker that crashed mid-send. Reset them so another worker picks up.
+    /// Reaper: rows stuck in `claimed` or `sending` longer than the timeout
+    /// were owned by a dead worker. Reset them so another worker picks up.
+    /// Retrying `sending` preserves recovery but can duplicate a delivery if
+    /// Telegram accepted the request before the worker crashed.
     pub async fn release_stale_claims(&self, timeout_secs: i64) -> Result<u64> {
         let res = sqlx::query(
             r#"
             UPDATE alerts
             SET state = 'pending', claimed_at = NULL, updated_at = now()
-            WHERE state = 'claimed'
+            WHERE state IN ('claimed', 'sending')
               AND claimed_at < now() - make_interval(secs => $1)
             "#,
         )
@@ -640,14 +711,14 @@ impl PgStore {
         Ok(res.rows_affected())
     }
 
-    /// Count of active (pending or claimed) alerts for one user. Used by the
+    /// Count of active (pending, claimed, or sending) alerts for one user. Used by the
     /// quota check in `/alert` and `/galert`. Hits the partial index
     /// `alerts_user_active_idx` so this stays sub-ms even at 10k+ users.
     pub async fn count_active_for_user(&self, user_id: i64) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(
             r#"
             SELECT count(*) FROM alerts
-            WHERE user_id = $1 AND state IN ('pending', 'claimed')
+            WHERE user_id = $1 AND state IN ('pending', 'claimed', 'sending')
             "#,
         )
         .bind(user_id)
@@ -662,7 +733,7 @@ impl PgStore {
         let row: (i64,) = sqlx::query_as(
             r#"
             SELECT count(*) FROM alerts
-            WHERE chat_id = $1 AND state IN ('pending', 'claimed')
+            WHERE chat_id = $1 AND state IN ('pending', 'claimed', 'sending')
             "#,
         )
         .bind(chat_id)
@@ -718,7 +789,7 @@ impl PgStore {
 #[derive(Debug, Clone, Copy)]
 pub struct Stats {
     pub users: i64,
-    /// pending + claimed — everything not yet delivered, cancelled, or failed.
+    /// Pending + claimed + sending: everything not finalised yet.
     pub active: i64,
     pub sent: i64,
     pub total: i64,
@@ -732,7 +803,7 @@ impl PgStore {
             r#"
             SELECT
                 (SELECT count(*) FROM users),
-                (SELECT count(*) FROM alerts WHERE state IN ('pending', 'claimed')),
+                (SELECT count(*) FROM alerts WHERE state IN ('pending', 'claimed', 'sending')),
                 (SELECT count(*) FROM alerts WHERE state = 'sent'),
                 (SELECT count(*) FROM alerts)
             "#,
@@ -816,6 +887,20 @@ fn row_to_alert(row: PgRow) -> Result<Alert> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn connection_enforces_server_version_and_session_timeouts() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let store = PgStore::connect(&database_url, 1).await.unwrap();
+        let settings: (String, String) = sqlx::query_as(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(settings, ("5s".to_owned(), "30s".to_owned()));
+    }
+
     #[test]
     fn quota_lock_order_is_canonical_across_id_roles() {
         assert_eq!(quota_lock_keys(-100, 42), (-100, Some(42)));
@@ -877,6 +962,13 @@ mod tests {
         assert_eq!(store.release_stale_claims(60).await.unwrap(), 1);
     }
 
+    async fn start_delivery(store: &PgStore, alert: &Alert) {
+        assert!(store
+            .begin_delivery(alert.id, alert.claim_generation)
+            .await
+            .unwrap());
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
     async fn stale_generation_cannot_mutate_a_reassigned_claim(pool: PgPool) {
@@ -913,6 +1005,7 @@ mod tests {
         assert_eq!(unchanged.fire_at, current.fire_at);
         assert_eq!(unchanged.attempts, current.attempts);
         assert_eq!(unchanged.last_error, None);
+        start_delivery(&store, &current).await;
         assert!(store
             .advance_to_next_occurrence(current.id, current.claim_generation, next)
             .await
@@ -930,7 +1023,10 @@ mod tests {
         due_alert(&store, "cancel me").await;
         let old = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
         expire_claim(&store, old.id).await;
-        assert!(store.cancel_alert(old.id, 42).await.unwrap());
+        assert_eq!(
+            store.cancel_alert(old.id, 42).await.unwrap(),
+            CancelAlertOutcome::Cancelled
+        );
         assert!(!store.mark_sent(old.id, old.claim_generation).await.unwrap());
         assert!(!store
             .mark_failed(old.id, old.claim_generation, "late")
@@ -957,10 +1053,13 @@ mod tests {
         due_alert(&store, "cancel claimed").await;
         let claimed = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
 
-        assert!(store
-            .cancel_alert(claimed.id, claimed.user_id)
-            .await
-            .unwrap());
+        assert_eq!(
+            store
+                .cancel_alert(claimed.id, claimed.user_id)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::Cancelled
+        );
         assert!(!store
             .mark_sent(claimed.id, claimed.claim_generation)
             .await
@@ -973,6 +1072,65 @@ mod tests {
             store.get_alert(claimed.id).await.unwrap().unwrap().state,
             AlertState::Cancelled
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn cancellation_and_delivery_start_have_one_atomic_winner(pool: PgPool) {
+        let store = PgStore { pool };
+        due_alert(&store, "race").await;
+        let claimed = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+
+        let (cancel, begin) = tokio::join!(
+            store.cancel_alert(claimed.id, claimed.user_id),
+            store.begin_delivery(claimed.id, claimed.claim_generation)
+        );
+        match (cancel.unwrap(), begin.unwrap()) {
+            (CancelAlertOutcome::Cancelled, false) => assert_eq!(
+                store.get_alert(claimed.id).await.unwrap().unwrap().state,
+                AlertState::Cancelled
+            ),
+            (CancelAlertOutcome::DeliveryStarted, true) => assert_eq!(
+                store.get_alert(claimed.id).await.unwrap().unwrap().state,
+                AlertState::Sending
+            ),
+            outcome => panic!("unexpected race outcome: {outcome:?}"),
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn cancellation_reports_when_delivery_already_started(pool: PgPool) {
+        let store = PgStore { pool };
+        due_alert(&store, "already sending").await;
+        let claimed = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        start_delivery(&store, &claimed).await;
+
+        assert_eq!(
+            store
+                .cancel_alert(claimed.id, claimed.user_id)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::DeliveryStarted
+        );
+        assert_eq!(
+            store.get_alert(claimed.id).await.unwrap().unwrap().state,
+            AlertState::Sending
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn stale_sending_delivery_is_retried_with_a_new_generation(pool: PgPool) {
+        let store = PgStore { pool };
+        due_alert(&store, "recover sending").await;
+        let sending = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        start_delivery(&store, &sending).await;
+
+        expire_claim(&store, sending.id).await;
+        let retry = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        assert_eq!(retry.id, sending.id);
+        assert!(retry.claim_generation > sending.claim_generation);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1156,6 +1314,7 @@ mod tests {
         store.upsert_user(42, Language::En).await.unwrap();
         due_alert(&store, "wake up").await;
         let source = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        start_delivery(&store, &source).await;
         assert!(store
             .record_alert_delivery(source.id, source.claim_generation, 42, 700)
             .await
@@ -1208,6 +1367,7 @@ mod tests {
             .await
             .unwrap();
         let source = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        start_delivery(&store, &source).await;
         assert!(store
             .record_alert_delivery(source.id, source.claim_generation, -100, 701)
             .await
@@ -1248,6 +1408,7 @@ mod tests {
         due_alert(&store, "first source").await;
         let other = due_alert(&store, "other source").await;
         let source = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        start_delivery(&store, &source).await;
         assert!(!store
             .record_alert_delivery(source.id, source.claim_generation + 1, 42, 704)
             .await
@@ -1283,6 +1444,7 @@ mod tests {
         store.upsert_user(42, Language::En).await.unwrap();
         due_alert(&store, "recurring-like source").await;
         let source = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        start_delivery(&store, &source).await;
         assert!(store
             .record_alert_delivery(source.id, source.claim_generation, 42, 702)
             .await
@@ -1307,6 +1469,7 @@ mod tests {
             .await
             .unwrap());
         let next = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        start_delivery(&store, &next).await;
         assert!(store
             .record_alert_delivery(next.id, next.claim_generation, 42, 703)
             .await
@@ -1328,8 +1491,10 @@ mod tests {
         let (a, b) = tokio::join!(store.claim_due_alerts(1, 5), store.claim_due_alerts(1, 5));
         let (a, b) = (a.unwrap().remove(0), b.unwrap().remove(0));
         assert_ne!(a.id, b.id);
+        start_delivery(&store, &a).await;
         assert!(store.mark_sent(a.id, a.claim_generation).await.unwrap());
         assert!(!store.mark_sent(a.id, a.claim_generation).await.unwrap());
+        start_delivery(&store, &b).await;
         assert!(store
             .reschedule(
                 b.id,
@@ -1342,6 +1507,7 @@ mod tests {
         assert_eq!(retry.id, b.id);
         assert!(retry.claim_generation > b.claim_generation);
         assert_eq!(retry.attempts, b.attempts + 1);
+        start_delivery(&store, &retry).await;
         assert!(store
             .mark_failed(retry.id, retry.claim_generation, "failed")
             .await

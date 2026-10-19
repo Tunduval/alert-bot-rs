@@ -27,6 +27,10 @@ const QUEUE_CAPACITY: usize = 128;
 const MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const WEBHOOK_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const WEBHOOK_DELETE_TIMEOUT: Duration = Duration::from_millis(100);
 const SECRET_HEADER: HeaderName = HeaderName::from_static("x-telegram-bot-api-secret-token");
 
 pub struct WebhookListener {
@@ -83,15 +87,14 @@ pub async fn start(
         .with_state(state);
 
     let server = tokio::spawn(async move {
-        let server_result = axum::serve(tcp_listener, app)
-            .with_graceful_shutdown(stop_flag)
+        let server_result = crate::bounded_http::serve(tcp_listener, app, stop_flag)
             .await
             .context("serving webhook requests");
-        let delete_result = bot
-            .delete_webhook()
-            .send()
-            .await
-            .context("deleting Telegram webhook");
+        let delete_result =
+            tokio::time::timeout(WEBHOOK_DELETE_TIMEOUT, bot.delete_webhook().send())
+                .await
+                .context("timed out deleting Telegram webhook")?
+                .context("deleting Telegram webhook");
         server_result.and(delete_result.map(|_| ()))
     });
 

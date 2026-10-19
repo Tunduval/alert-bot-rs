@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Daily signed Postgres backup -> Netcup SFTP. Native (no docker).
+# Daily encrypted and signed Postgres backup -> Netcup SFTP. Native (no docker).
 #
 # Runs as the dedicated `alertbot-backup` system user. Its matching PostgreSQL
 # role has read-only grants for pg_dump and cannot assume the application
@@ -11,6 +11,7 @@
 #   BACKUP_NETCUP_USER    SFTP username
 #   BACKUP_NETCUP_PASS    SFTP password
 #   BACKUP_SFTP_HOSTKEY_SHA256  base64 SHA-256 host-key hash, without SHA256:
+#   BACKUP_AGE_RECIPIENT  native age X25519 public recipient (age1...)
 #
 # Required systemd credential:
 #   backup-signing-key    RSA private key
@@ -21,7 +22,7 @@
 #   DB_NAME               postgres database to dump (default: alertbot)
 #   RETENTION_DAYS        prune remote dumps older than N days (default: 30)
 #
-# Required packages on the host: postgresql-client, curl, openssl, sshpass
+# Required packages on the host: age, postgresql-client, curl, openssl, sshpass
 
 set -euo pipefail
 
@@ -29,6 +30,7 @@ set -euo pipefail
 : "${BACKUP_NETCUP_USER:?must be set}"
 : "${BACKUP_NETCUP_PASS:?must be set}"
 : "${BACKUP_SFTP_HOSTKEY_SHA256:?must be set}"
+: "${BACKUP_AGE_RECIPIENT:?must be set}"
 : "${BACKUP_NETCUP_PATH:=backups/alertbot}"
 : "${BACKUP_KNOWN_HOSTS:=/etc/alertbot-backup-known-hosts}"
 : "${DB_NAME:=alertbot}"
@@ -43,6 +45,8 @@ SIGNING_KEY="${CREDENTIALS_DIRECTORY}/backup-signing-key"
     || { echo "invalid BACKUP_NETCUP_USER" >&2; exit 2; }
 [[ "$BACKUP_SFTP_HOSTKEY_SHA256" =~ ^[A-Za-z0-9+/]{43}$ ]] \
     || { echo "invalid BACKUP_SFTP_HOSTKEY_SHA256" >&2; exit 2; }
+[[ "$BACKUP_AGE_RECIPIENT" =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]] \
+    || { echo "invalid BACKUP_AGE_RECIPIENT" >&2; exit 2; }
 [[ "$BACKUP_NETCUP_PATH" =~ ^[A-Za-z0-9._/-]+$ ]] \
     && [[ "/$BACKUP_NETCUP_PATH/" != *"/../"* ]] \
     && [[ "$BACKUP_NETCUP_PATH" != /* ]] \
@@ -60,6 +64,33 @@ CURL_HELP=$(curl --help all 2>/dev/null) \
 [[ "$CURL_HELP" == *"--hostpubsha256"* ]] \
     || { echo "curl lacks --hostpubsha256 support" >&2; exit 2; }
 unset CURL_HELP
+
+# Ask age to parse the recipient before reading the database. This rejects
+# strings that match the public-key shape but have an invalid Bech32 checksum.
+age --encrypt --recipient "$BACKUP_AGE_RECIPIENT" \
+    </dev/null >/dev/null 2>/dev/null \
+    || { echo "invalid BACKUP_AGE_RECIPIENT" >&2; exit 2; }
+
+PG_DUMP_VERSION_OUTPUT=$(pg_dump --version 2>/dev/null) \
+    || { echo "cannot inspect pg_dump version" >&2; exit 2; }
+[[ "$PG_DUMP_VERSION_OUTPUT" =~ ^pg_dump\ \(PostgreSQL\)\ ([0-9]+)\.([0-9]+)([^0-9].*)?$ ]] \
+    || { echo "unrecognized pg_dump version" >&2; exit 2; }
+PG_DUMP_MAJOR=${BASH_REMATCH[1]}
+PG_DUMP_MINOR=${BASH_REMATCH[2]}
+case "$PG_DUMP_MAJOR" in
+    16) PG_DUMP_FIXED_MINOR=15 ;;
+    17) PG_DUMP_FIXED_MINOR=11 ;;
+    18) PG_DUMP_FIXED_MINOR=6 ;;
+    *)
+        echo "unsupported pg_dump major ${PG_DUMP_MAJOR}; refusing backup" >&2
+        exit 2
+        ;;
+esac
+if (( 10#$PG_DUMP_MINOR < PG_DUMP_FIXED_MINOR )); then
+    echo "pg_dump ${PG_DUMP_MAJOR}.${PG_DUMP_MINOR} is vulnerable to CVE-2026-19385" >&2
+    exit 2
+fi
+unset PG_DUMP_VERSION_OUTPUT PG_DUMP_MAJOR PG_DUMP_MINOR PG_DUMP_FIXED_MINOR
 
 umask 077
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/alertbot-backup.XXXXXX")
@@ -101,38 +132,61 @@ SFTP_COMMON=(
 )
 
 DATE=$(date -u +%Y-%m-%dT%H%M%SZ)
-FILE_NAME="alertbot-${DATE}.dump"
+FILE_NAME="alertbot-${DATE}.dump.age"
 REMOTE_FILE="${BACKUP_NETCUP_PATH}/${FILE_NAME}"
-REMOTE_SIGNATURE="${REMOTE_FILE}.sig"
-DUMP_FILE="${WORK_DIR}/${FILE_NAME}"
-SIGNATURE_FILE="${DUMP_FILE}.sig"
+REMOTE_MANIFEST="${REMOTE_FILE}.manifest"
+REMOTE_SIGNATURE="${REMOTE_MANIFEST}.sig"
+DUMP_FILE="${WORK_DIR}/${FILE_NAME%.age}"
+ENCRYPTED_FILE="${WORK_DIR}/${FILE_NAME}"
+MANIFEST_FILE="${ENCRYPTED_FILE}.manifest"
+SIGNATURE_FILE="${MANIFEST_FILE}.sig"
 
-echo "[backup] dumping ${DB_NAME} -> ${REMOTE_FILE}"
+echo "[backup] encrypting ${DB_NAME} backup -> ${REMOTE_FILE}"
 
 pg_dump --format=custom --no-owner --no-privileges \
     --file="$DUMP_FILE" "$DB_NAME"
+age --encrypt --recipient "$BACKUP_AGE_RECIPIENT" \
+    --output "$ENCRYPTED_FILE" "$DUMP_FILE"
+rm -f -- "$DUMP_FILE"
+ENCRYPTED_SIZE=$(wc -c <"$ENCRYPTED_FILE" | tr -d '[:space:]')
+ENCRYPTED_SHA256=$(openssl dgst -sha256 -r "$ENCRYPTED_FILE")
+ENCRYPTED_SHA256=${ENCRYPTED_SHA256%% *}
+[[ "$ENCRYPTED_SIZE" =~ ^[0-9]+$ ]] \
+    && [[ "$ENCRYPTED_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo "cannot describe encrypted backup" >&2; exit 2; }
+printf '%s\n' \
+    'format_version=2' \
+    "database=${DB_NAME}" \
+    "filename=${FILE_NAME}" \
+    "created_at=${DATE}" \
+    "size_bytes=${ENCRYPTED_SIZE}" \
+    "sha256=${ENCRYPTED_SHA256}" >"$MANIFEST_FILE"
 openssl dgst -sha256 -sign "$SIGNING_KEY" \
-    -out "$SIGNATURE_FILE" "$DUMP_FILE"
+    -out "$SIGNATURE_FILE" "$MANIFEST_FILE"
 
-# Publish the signature first and the dump last. Therefore a final dump name
-# is visible only after both complete files have reached the SFTP server.
-for local_file in "$DUMP_FILE" "$SIGNATURE_FILE"; do
+# Publish the signature and manifest first and the dump last. Therefore a final
+# dump name is visible only after all three complete files reached the server.
+for local_file in "$ENCRYPTED_FILE" "$MANIFEST_FILE" "$SIGNATURE_FILE"; do
     remote_file="$REMOTE_FILE"
-    [[ "$local_file" == "$SIGNATURE_FILE" ]] && remote_file="$REMOTE_SIGNATURE"
+    if [[ "$local_file" == "$MANIFEST_FILE" ]]; then
+        remote_file="$REMOTE_MANIFEST"
+    elif [[ "$local_file" == "$SIGNATURE_FILE" ]]; then
+        remote_file="$REMOTE_SIGNATURE"
+    fi
     curl "${CURL_COMMON[@]}" \
          --upload-file "$local_file" \
          --ftp-create-dirs \
          "sftp://${BACKUP_NETCUP_HOST}/${remote_file}.part"
 done
 
-for remote_file in "$REMOTE_SIGNATURE" "$REMOTE_FILE"; do
+for remote_file in "$REMOTE_SIGNATURE" "$REMOTE_MANIFEST" "$REMOTE_FILE"; do
     curl "${CURL_COMMON[@]}" \
          --quote "rename ${remote_file}.part ${remote_file}" \
          --output /dev/null \
          "sftp://${BACKUP_NETCUP_HOST}/${BACKUP_NETCUP_PATH}/"
 done
 
-echo "[backup] uploaded signed dump"
+echo "[backup] uploaded encrypted dump with signed manifest"
 
 CUTOFF_EPOCH=$(date -u -d "${RETENTION_DAYS} days ago" +%s 2>/dev/null \
               || date -u -v-"${RETENTION_DAYS}d" +%s)
@@ -140,8 +194,23 @@ CUTOFF_EPOCH=$(date -u -d "${RETENTION_DAYS} days ago" +%s 2>/dev/null \
 LIST_BATCH="${WORK_DIR}/list.batch"
 LIST_OUTPUT="${WORK_DIR}/list.output"
 printf 'cd %s\nls -1\nbye\n' "$BACKUP_NETCUP_PATH" >"$LIST_BATCH"
-SSHPASS="$SFTP_PASSWORD" sshpass -e sftp "${SFTP_COMMON[@]}" -b "$LIST_BATCH" \
-    "${BACKUP_NETCUP_USER}@${BACKUP_NETCUP_HOST}" >"$LIST_OUTPUT"
+RETENTION_LIST_MAX_BYTES=1048576
+set +e
+SSHPASS="$SFTP_PASSWORD" timeout --signal=TERM --kill-after=5s 60s \
+    sshpass -e sftp "${SFTP_COMMON[@]}" -b "$LIST_BATCH" \
+    "${BACKUP_NETCUP_USER}@${BACKUP_NETCUP_HOST}" \
+    | head -c "$((RETENTION_LIST_MAX_BYTES + 1))" >"$LIST_OUTPUT"
+LIST_PIPE_STATUS=("${PIPESTATUS[@]}")
+set -e
+LIST_OUTPUT_SIZE=$(wc -c <"$LIST_OUTPUT" | tr -d '[:space:]')
+if (( LIST_OUTPUT_SIZE > RETENTION_LIST_MAX_BYTES )); then
+    echo "retention listing exceeds ${RETENTION_LIST_MAX_BYTES} bytes" >&2
+    exit 2
+fi
+if (( LIST_PIPE_STATUS[0] != 0 || LIST_PIPE_STATUS[1] != 0 )); then
+    echo "retention listing failed or exceeded 60 seconds" >&2
+    exit 2
+fi
 
 DELETE_BATCH="${WORK_DIR}/delete.batch"
 printf 'cd %s\n' "$BACKUP_NETCUP_PATH" >"$DELETE_BATCH"
@@ -159,7 +228,7 @@ while IFS= read -r file_name; do
         printf 'rm %s\n' "$file_name" >>"$DELETE_BATCH"
         ((DELETE_COUNT += 1))
     fi
-done < <(grep -E '^alertbot-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z\.dump(\.sig)?(\.part)?$' "$LIST_OUTPUT" || true)
+done < <(grep -E '^alertbot-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z\.dump\.age(\.part|\.manifest(\.part|\.sig(\.part)?)?)?$' "$LIST_OUTPUT" || true)
 
 if (( DELETE_COUNT > 0 )); then
     printf 'bye\n' >>"$DELETE_BATCH"

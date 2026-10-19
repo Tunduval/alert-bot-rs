@@ -25,14 +25,22 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
 ProtectControlGroups=true
+ProtectProc=invisible
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+UMask=0077
 
 # Resource caps — bot baseline is tiny; raise if you see OOMs
 MemoryMax=256M
+CPUQuota=100%
 TasksMax=64
 LimitNOFILE=256
 

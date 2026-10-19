@@ -7,12 +7,12 @@ use chrono_tz::Tz;
 use teloxide::prelude::*;
 use teloxide::types::{
     BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
-    ParseMode, PublicChatKind, Recipient,
+    ParseMode, PublicChatKind, Recipient, UserId,
 };
 
 use botcore::{AlertScope, ChatType, Language, NewAlert};
 use parser::ParseContext;
-use storage::{AlertLimits, CreateAlertOutcome, CreateSnoozeOutcome, PgStore};
+use storage::{AlertLimits, CancelAlertOutcome, CreateAlertOutcome, CreateSnoozeOutcome, PgStore};
 
 use crate::commands::Command;
 use crate::identity;
@@ -315,11 +315,10 @@ async fn cancel(
             .await?;
         return Ok(());
     }
-    let ok = store.cancel_alert(id, requester).await?;
-    let reply = if ok {
-        m::cancel_ok(lang, id)
-    } else {
-        m::cancel_not_found(lang).to_string()
+    let reply = match store.cancel_alert(id, requester).await? {
+        CancelAlertOutcome::Cancelled => m::cancel_ok(lang, id),
+        CancelAlertOutcome::DeliveryStarted => m::cancel_delivery_started(lang).to_string(),
+        CancelAlertOutcome::NotCancellable => m::cancel_not_found(lang).to_string(),
     };
     bot.send_message(msg.chat.id, reply).await?;
     Ok(())
@@ -469,6 +468,54 @@ async fn callback_alert_in_origin_chat(
     Ok(Some(alert))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedMembership {
+    Current,
+    NotCurrent,
+    Unavailable,
+}
+
+/// Verify shared-alert authority against Telegram immediately before mutation.
+/// Telegram only guarantees `getChatMember` for other users when the bot is a
+/// chat administrator, so every API failure must deny the mutation.
+async fn shared_membership(bot: &Bot, chat_id: ChatId, requester: UserId) -> SharedMembership {
+    match bot.get_chat_member(chat_id, requester).await {
+        Ok(member) if member.is_present() => SharedMembership::Current,
+        Ok(_) => SharedMembership::NotCurrent,
+        Err(error) => {
+            tracing::warn!(
+                chat_id = chat_id.0,
+                requester = requester.0,
+                error = ?error,
+                "shared callback membership check failed"
+            );
+            SharedMembership::Unavailable
+        }
+    }
+}
+
+async fn shared_callback_mutation_allowed(
+    bot: &Bot,
+    query: &CallbackQuery,
+    alert: &botcore::Alert,
+    lang: Language,
+) -> Result<bool, teloxide::RequestError> {
+    if alert.scope == AlertScope::Private {
+        return Ok(true);
+    }
+
+    let message = match shared_membership(bot, ChatId(alert.chat_id), query.from.id).await {
+        SharedMembership::Current => return Ok(true),
+        SharedMembership::NotCurrent => m::shared_membership_required(lang),
+        SharedMembership::Unavailable => m::shared_membership_check_failed(lang),
+    };
+    bot.answer_callback_query(query.id.clone())
+        .text(message)
+        .show_alert(true)
+        .await?;
+    Ok(false)
+}
+
 async fn handle_cancel_callback(
     bot: &Bot,
     store: &PgStore,
@@ -477,32 +524,39 @@ async fn handle_cancel_callback(
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
-    if callback_alert_in_origin_chat(store, query, alert_id)
-        .await?
-        .is_none()
-    {
+    let Some(alert) = callback_alert_in_origin_chat(store, query, alert_id).await? else {
         bot.answer_callback_query(query.id.clone())
             .text(m::cancel_not_allowed(lang))
             .show_alert(true)
             .await?;
         return Ok(());
+    };
+    if !shared_callback_mutation_allowed(bot, query, &alert, lang).await? {
+        return Ok(());
     }
-    let ok = store.cancel_alert(alert_id, requester).await?;
-
-    if ok {
-        if let Some(msg) = query.message.as_ref() {
-            bot.edit_message_text(msg.chat().id, msg.id(), m::cancelled_inline(lang, alert_id))
-                .await
-                .ok();
+    match store.cancel_alert(alert_id, requester).await? {
+        CancelAlertOutcome::Cancelled => {
+            if let Some(msg) = query.message.as_ref() {
+                bot.edit_message_text(msg.chat().id, msg.id(), m::cancelled_inline(lang, alert_id))
+                    .await
+                    .ok();
+            }
+            bot.answer_callback_query(query.id.clone())
+                .text(m::callback_cancelled(lang))
+                .await?;
         }
-        bot.answer_callback_query(query.id.clone())
-            .text(m::callback_cancelled(lang))
-            .await?;
-    } else {
-        bot.answer_callback_query(query.id.clone())
-            .text(m::cancel_not_allowed(lang))
-            .show_alert(true)
-            .await?;
+        CancelAlertOutcome::DeliveryStarted => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::cancel_delivery_started(lang))
+                .show_alert(true)
+                .await?;
+        }
+        CancelAlertOutcome::NotCancellable => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::cancel_not_allowed(lang))
+                .show_alert(true)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -538,6 +592,9 @@ async fn handle_snooze_callback(
             .text(m::cancel_not_allowed(user.language))
             .show_alert(true)
             .await?;
+        return Ok(());
+    }
+    if !shared_callback_mutation_allowed(bot, query, &original, user.language).await? {
         return Ok(());
     }
 
@@ -631,33 +688,41 @@ async fn handle_stop_series_callback(
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
-    if callback_alert_in_origin_chat(store, query, alert_id)
-        .await?
-        .is_none()
-    {
+    let Some(alert) = callback_alert_in_origin_chat(store, query, alert_id).await? else {
         bot.answer_callback_query(query.id.clone())
             .text(m::cancel_not_allowed(lang))
             .show_alert(true)
             .await?;
         return Ok(());
+    };
+    if !shared_callback_mutation_allowed(bot, query, &alert, lang).await? {
+        return Ok(());
     }
-    let ok = store.cancel_alert(alert_id, requester).await?;
-    if ok {
-        // Strip buttons first — the series is gone, so the +5m / Serie beenden
-        // controls on this delivered message would all no-op or surprise the user.
-        clear_inline_buttons(bot, query).await;
-        if let Some(msg) = query.message.as_ref() {
-            bot.send_message(msg.chat().id, m::series_stopped(lang, alert_id))
+    match store.cancel_alert(alert_id, requester).await? {
+        CancelAlertOutcome::Cancelled => {
+            // Strip buttons first — the series is gone, so the +5m / Serie beenden
+            // controls on this delivered message would all no-op or surprise the user.
+            clear_inline_buttons(bot, query).await;
+            if let Some(msg) = query.message.as_ref() {
+                bot.send_message(msg.chat().id, m::series_stopped(lang, alert_id))
+                    .await?;
+            }
+            bot.answer_callback_query(query.id.clone())
+                .text(m::callback_cancelled(lang))
                 .await?;
         }
-        bot.answer_callback_query(query.id.clone())
-            .text(m::callback_cancelled(lang))
-            .await?;
-    } else {
-        bot.answer_callback_query(query.id.clone())
-            .text(m::cancel_not_allowed(lang))
-            .show_alert(true)
-            .await?;
+        CancelAlertOutcome::DeliveryStarted => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::cancel_delivery_started(lang))
+                .show_alert(true)
+                .await?;
+        }
+        CancelAlertOutcome::NotCancellable => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::cancel_not_allowed(lang))
+                .show_alert(true)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -815,6 +880,51 @@ fn telegram_text_len(value: &str) -> usize {
 mod tests {
     use super::*;
     use teloxide::types::InlineKeyboardButtonKind;
+
+    async fn membership_from_mock(response: &'static str) -> SharedMembership {
+        let app = axum::Router::new().fallback(move || async move { response });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = shared_membership(
+            &Bot::new("123:test").set_api_url(url),
+            ChatId(-100),
+            UserId(42),
+        )
+        .await;
+        server.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn shared_membership_accepts_current_members() {
+        let response = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"member"}}"#;
+        assert_eq!(
+            membership_from_mock(response).await,
+            SharedMembership::Current
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_membership_rejects_users_who_left() {
+        let response = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"left"}}"#;
+        assert_eq!(
+            membership_from_mock(response).await,
+            SharedMembership::NotCurrent
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_membership_fails_closed_on_telegram_errors() {
+        let response =
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: user not found"}"#;
+        assert_eq!(
+            membership_from_mock(response).await,
+            SharedMembership::Unavailable
+        );
+    }
 
     #[test]
     fn snooze_only_accepts_offered_intervals() {

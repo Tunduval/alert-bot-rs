@@ -485,10 +485,33 @@ pub fn cancel_not_allowed(lang: Language) -> &'static str {
     }
 }
 
+pub fn shared_membership_required(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Nur aktuelle Gruppenmitglieder dürfen diesen Reminder löschen.",
+        Language::En => "Only current group members can cancel this reminder.",
+    }
+}
+
+pub fn shared_membership_check_failed(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Ich konnte deine Gruppenmitgliedschaft nicht prüfen. Der Reminder bleibt bestehen."
+        }
+        Language::En => "I couldn't verify your group membership. The reminder was not changed.",
+    }
+}
+
 pub fn cancel_not_found(lang: Language) -> &'static str {
     match lang {
         Language::De => "Reminder nicht gefunden.",
         Language::En => "Reminder not found.",
+    }
+}
+
+pub fn cancel_delivery_started(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Die Zustellung hat bereits begonnen. Der Reminder wurde nicht gelöscht.",
+        Language::En => "Delivery has already started. The reminder was not cancelled.",
     }
 }
 
