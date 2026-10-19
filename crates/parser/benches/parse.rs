@@ -12,7 +12,9 @@
 
 use chrono::{TimeZone, Utc};
 use chrono_tz::Tz;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use parser::{parse, Language, ParseContext};
 
 fn ctx() -> ParseContext {
