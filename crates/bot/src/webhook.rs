@@ -11,6 +11,7 @@ use axum::{
 };
 use teloxide::{
     prelude::*,
+    requests::Request as _,
     stop::{mk_stop_token, StopFlag, StopToken},
     types::{AllowedUpdate, Update, UpdateKind},
     update_listeners::{AsUpdateStream, UpdateListener},

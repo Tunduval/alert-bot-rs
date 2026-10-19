@@ -238,7 +238,7 @@ impl std::fmt::Debug for Transport {
             Transport::Webhook {
                 listen,
                 url,
-                secret,
+                secret: _,
             } => f
                 .debug_struct("Webhook")
                 .field("listen", listen)
