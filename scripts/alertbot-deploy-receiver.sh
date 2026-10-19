@@ -14,6 +14,8 @@ readonly RECEIVER=/usr/local/sbin/alertbot-deploy-receiver.sh
 readonly SERVICE_UNIT=/etc/systemd/system/alert-bot.service
 readonly SERVICE_UNIT_SHA256=deaa8e4c95809256ac2ab604ba8ec4fb38dc688463e2d06985d3d0d7dcac3677
 readonly TARGET=/usr/local/bin/alert-bot
+readonly LOCK_DIR=/run/alertbot-deploy
+readonly LOCK_FILE=$LOCK_DIR/deploy.lock
 
 reject() {
     echo "deploy rejected: $*" >&2
@@ -33,9 +35,26 @@ for trusted_dir in /usr /usr/local /usr/local/bin /usr/local/sbin \
         reject "unsafe directory ownership or mode: $trusted_dir"
 done
 
+# Keep the lock outside the world-writable /run/lock directory. Otherwise the
+# deployed service account could pre-create it after a reboot and block root's
+# open through fs.protected_regular.
+if [[ ! -e "$LOCK_DIR" && ! -L "$LOCK_DIR" ]]; then
+    install -d -o root -g root -m 0755 "$LOCK_DIR"
+fi
+[[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] || reject "unsafe deploy lock directory"
+[[ $(stat -c '%U:%G:%a' "$LOCK_DIR") == root:root:755 ]] ||
+    reject "unsafe deploy lock directory"
+if [[ -e "$LOCK_FILE" || -L "$LOCK_FILE" ]]; then
+    [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] || reject "unsafe deploy lock file"
+    [[ $(stat -c '%U:%G:%a' "$LOCK_FILE") == root:root:600 ]] ||
+        reject "unsafe deploy lock file"
+fi
+
 # Serialize deployments before allocating a staging file. This bounds disk use
 # even when several authenticated clients connect at once.
-exec 9>/run/lock/alertbot-deploy.lock
+exec 9>"$LOCK_FILE"
+[[ $(stat -Lc '%u:%g:%a' /proc/self/fd/9) == 0:0:600 ]] ||
+    reject "unsafe deploy lock file"
 flock -n 9 || reject "another deployment is already running"
 
 # A deploy key may choose the program bytes, but those bytes must only ever run

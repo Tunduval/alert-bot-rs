@@ -366,7 +366,9 @@ unset deploy_key
 
 The forced command accepts one ELF binary of at most 64 MiB, installs it
 atomically, and restarts only `alert-bot`. It refuses concurrent deploys and
-refuses to run if the reviewed service unit or its non-root sandbox changed.
+keeps its lock under root-owned `/run/alertbot-deploy`, not the world-writable
+`/run/lock`. It refuses to run if the reviewed service unit or its non-root
+sandbox changed.
 The key cannot open a shell, forward ports, run `scp`, or invoke another root
 command. If its forced shell were ever bypassed, the attacker would still be
 the unprivileged `alertbot-deploy` user and `sudo` would still allow only the

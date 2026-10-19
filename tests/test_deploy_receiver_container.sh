@@ -51,6 +51,20 @@ actual=$($receiver < /bin/true)
 [[ "$actual" == "alert-bot deployed sha256=$expected" ]]
 [[ $(sha256sum /usr/local/bin/alert-bot) == "$expected  /usr/local/bin/alert-bot" ]]
 [[ ! -e /usr/local/bin/.alert-bot.deploy.ABC123 ]]
+[[ $(stat -c '%U:%G:%a' /run/alertbot-deploy) == root:root:755 ]]
+[[ $(stat -c '%U:%G:%a' /run/alertbot-deploy/deploy.lock) == root:root:600 ]]
+
+# A pre-created or redirected lock must fail closed without touching its target.
+rm -f /run/alertbot-deploy/deploy.lock
+touch /tmp/lock-victim
+ln -s /tmp/lock-victim /run/alertbot-deploy/deploy.lock
+if $receiver < /bin/true 2>/tmp/unsafe-lock.err; then
+    echo "unsafe deploy lock was accepted" >&2
+    exit 1
+fi
+grep -Fq "unsafe deploy lock file" /tmp/unsafe-lock.err
+[[ ! -s /tmp/lock-victim ]]
+rm -f /run/alertbot-deploy/deploy.lock
 
 # Invalid bytes must not replace the installed binary.
 if printf nope | $receiver 2>/tmp/invalid.err; then
@@ -79,10 +93,10 @@ grep -Fq "unsafe directory ownership or mode" /tmp/mode.err
 chmod 0755 /usr/local/bin
 
 # A second authenticated session cannot race an active deployment.
-flock /run/lock/alertbot-deploy.lock sleep 5 &
+flock /run/alertbot-deploy/deploy.lock sleep 5 &
 locker=$!
 for _ in 1 2 3 4 5; do
-    if ! flock -n /run/lock/alertbot-deploy.lock true; then
+    if ! flock -n /run/alertbot-deploy/deploy.lock true; then
         break
     fi
     sleep 0.1
