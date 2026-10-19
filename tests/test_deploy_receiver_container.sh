@@ -56,14 +56,14 @@ actual=$($receiver < /bin/true)
 
 # A pre-created or redirected lock must fail closed without touching its target.
 rm -f /run/alertbot-deploy/deploy.lock
-touch /tmp/lock-victim
+printf 'preserve\n' >/tmp/lock-victim
 ln -s /tmp/lock-victim /run/alertbot-deploy/deploy.lock
 if $receiver < /bin/true 2>/tmp/unsafe-lock.err; then
     echo "unsafe deploy lock was accepted" >&2
     exit 1
 fi
 grep -Fq "unsafe deploy lock file" /tmp/unsafe-lock.err
-[[ ! -s /tmp/lock-victim ]]
+grep -Fxq "preserve" /tmp/lock-victim
 rm -f /run/alertbot-deploy/deploy.lock
 
 # Invalid bytes must not replace the installed binary.
