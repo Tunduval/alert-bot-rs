@@ -10,6 +10,7 @@ umask 077
 
 readonly MAX_BINARY_BYTES=67108864
 readonly SERVICE=alert-bot
+readonly RECEIVER=/usr/local/sbin/alertbot-deploy-receiver.sh
 readonly SERVICE_UNIT=/etc/systemd/system/alert-bot.service
 readonly SERVICE_UNIT_SHA256=0b1e1eaf92b1ab63e035f0a0a4985400fee21a9696abe0f5d42ec72c2fc7e3b1
 readonly TARGET=/usr/local/bin/alert-bot
@@ -20,6 +21,17 @@ reject() {
 }
 
 (( EUID == 0 )) || reject "receiver must run as root"
+[[ "$0" == "$RECEIVER" && ! -L "$RECEIVER" ]] || reject "unexpected receiver path"
+[[ $(stat -c '%U:%G:%a' "$RECEIVER") == root:root:755 ]] ||
+    reject "receiver ownership or mode is unsafe"
+[[ ! -L "$SERVICE_UNIT" && $(stat -c '%U:%G:%a' "$SERVICE_UNIT") == root:root:644 ]] ||
+    reject "systemd unit ownership or mode is unsafe"
+for trusted_dir in /usr /usr/local /usr/local/bin /usr/local/sbin \
+    /etc /etc/systemd /etc/systemd/system; do
+    [[ -d "$trusted_dir" && ! -L "$trusted_dir" ]] || reject "unsafe path: $trusted_dir"
+    [[ $(stat -c '%U:%G:%a' "$trusted_dir") == root:root:755 ]] ||
+        reject "unsafe directory ownership or mode: $trusted_dir"
+done
 
 # Serialize deployments before allocating a staging file. This bounds disk use
 # even when several authenticated clients connect at once.
@@ -42,8 +54,9 @@ printf '%s  %s\n' "$SERVICE_UNIT_SHA256" "$SERVICE_UNIT" |
 [[ $(systemctl show --property=NoNewPrivileges --value "$SERVICE") == yes ]] ||
     reject "systemd service must set NoNewPrivileges=yes"
 
+# No legitimate staging file can exist while this exclusive lock is held.
 find /usr/local/bin -xdev -maxdepth 1 -type f \
-    -name '.alert-bot.deploy.??????' -user root -mmin +10 -delete
+    -name '.alert-bot.deploy.??????' -user root -delete
 
 staging=$(mktemp /usr/local/bin/.alert-bot.deploy.XXXXXX)
 trap 'rm -f -- "$staging"' EXIT

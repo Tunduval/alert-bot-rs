@@ -163,15 +163,27 @@ files and a config file. Copy them over the first time:
 
 ```bash
 # from your dev machine
-scp scripts/systemd/alert-bot.service       root@<lxc-ip>:/etc/systemd/system/
-scp scripts/systemd/alertbot-backup.service root@<lxc-ip>:/etc/systemd/system/
-scp scripts/systemd/alertbot-backup.timer   root@<lxc-ip>:/etc/systemd/system/
-scp scripts/backup-postgres.sh              root@<lxc-ip>:/usr/local/bin/alertbot-backup.sh
-scp scripts/alertbot-deploy-receiver.sh     root@<lxc-ip>:/usr/local/sbin/
+ssh root@<lxc-ip> install -d -o root -g root -m 0700 /root/alertbot-install
+scp scripts/systemd/alert-bot.service       root@<lxc-ip>:/root/alertbot-install/
+scp scripts/systemd/alertbot-backup.service root@<lxc-ip>:/root/alertbot-install/
+scp scripts/systemd/alertbot-backup.timer   root@<lxc-ip>:/root/alertbot-install/
+scp scripts/backup-postgres.sh              root@<lxc-ip>:/root/alertbot-install/
+scp scripts/alertbot-deploy-receiver.sh     root@<lxc-ip>:/root/alertbot-install/
 ```
 
 ```bash
 # on the LXC
+install -o root -g root -m 0644 /root/alertbot-install/alert-bot.service \
+    /etc/systemd/system/alert-bot.service
+install -o root -g root -m 0644 /root/alertbot-install/alertbot-backup.service \
+    /etc/systemd/system/alertbot-backup.service
+install -o root -g root -m 0644 /root/alertbot-install/alertbot-backup.timer \
+    /etc/systemd/system/alertbot-backup.timer
+install -o root -g root -m 0755 /root/alertbot-install/backup-postgres.sh \
+    /usr/local/bin/alertbot-backup.sh
+install -o root -g root -m 0755 /root/alertbot-install/alertbot-deploy-receiver.sh \
+    /usr/local/sbin/alertbot-deploy-receiver.sh
+
 install -d -o root -g alertbot -m 0750 /etc/alert-bot
 install -o root -g alertbot -m 0640 /dev/null /etc/alert-bot/config.env
 webhook_secret=$(openssl rand -hex 32)
@@ -185,8 +197,6 @@ EOF
 printf 'WEBHOOK_SECRET=%s\n' "$webhook_secret" >> /etc/alert-bot/config.env
 unset webhook_secret
 
-chmod +x /usr/local/bin/alertbot-backup.sh
-chmod 0755 /usr/local/sbin/alertbot-deploy-receiver.sh
 systemctl daemon-reload
 ```
 
@@ -332,8 +342,14 @@ EOF
 sshd -t
 sshd -T -C user=alertbot-deploy,host=localhost,addr=127.0.0.1 | \
     grep -Ei '^(authenticationmethods|passwordauthentication|kbdinteractiveauthentication|permittty|disableforwarding|permituserrc|permittunnel|permituserenvironment|forcecommand) '
+sshd -T -C user=alertbot-deploy,host=localhost,addr=127.0.0.1 | \
+    grep -Ei '^acceptenv '
 systemctl reload ssh
 ```
+
+The effective `AcceptEnv` list may contain locale variables such as `LANG` and
+`LC_*`. It must not contain a name or wildcard that can match `BASH_ENV`, `ENV`,
+or `LD_*`.
 
 **Generate a dedicated key pair** (don't reuse your personal one):
 
