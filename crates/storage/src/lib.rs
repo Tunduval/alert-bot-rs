@@ -46,6 +46,20 @@ impl PgStore {
             // Recycle idle connections after 10 min so they don't outlive
             // postgres's own idle-in-transaction or NAT keepalive limits.
             .idle_timeout(std::time::Duration::from_secs(600))
+            // A local role can hold advisory locks even without table write
+            // privileges. Bound every application wait so it cannot consume
+            // the complete pool indefinitely.
+            .after_connect(|connection, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET lock_timeout = '5s'")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET statement_timeout = '30s'")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(url)
             .await?;
         Ok(Self { pool })
@@ -641,5 +655,19 @@ mod tests {
                 .as_deref(),
             Some("failed")
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn connection_applies_session_timeouts() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let store = PgStore::connect(&database_url, 1).await.unwrap();
+        let settings: (String, String) = sqlx::query_as(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(settings, ("5s".to_owned(), "30s".to_owned()));
     }
 }
