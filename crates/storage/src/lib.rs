@@ -529,6 +529,8 @@ impl PgStore {
     ///
     /// The row lock serialises this decision with `begin_delivery`. Once the
     /// delivery CAS wins, callers get an honest `DeliveryStarted` result.
+    /// Group administrators may clean up ordinary private group alerts, but
+    /// never private snoozes created and owned by another user.
     pub async fn cancel_alert(
         &self,
         id: i64,
@@ -539,7 +541,7 @@ impl PgStore {
     ) -> Result<CancelAlertOutcome> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT user_id, chat_id, chat_type, scope, state
+            "SELECT user_id, chat_id, chat_type, scope, state, snooze_source_alert_id
              FROM alerts WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -559,12 +561,16 @@ impl PgStore {
         let state_value: String = row.try_get("state")?;
         let state = AlertState::parse(&state_value)
             .ok_or_else(|| StorageError::InvalidEnum(state_value.clone()))?;
+        let snooze_source_alert_id: Option<i64> = row.try_get("snooze_source_alert_id")?;
         if chat_id != origin_chat_id || &chat_type != origin_chat_type {
             return Ok(CancelAlertOutcome::NotCancellable);
         }
         let allowed = match scope {
             AlertScope::Private => {
-                user_id == requester_user_id || (allow_group_admin_override && chat_type.is_group())
+                user_id == requester_user_id
+                    || (allow_group_admin_override
+                        && chat_type.is_group()
+                        && snooze_source_alert_id.is_none())
             }
             AlertScope::Shared => true,
         };
@@ -1176,6 +1182,55 @@ mod tests {
         assert_eq!(
             store
                 .cancel_alert(alert.id, 7, -100, &ChatType::Group, true)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::Cancelled
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn group_admin_override_from_commands_or_callbacks_cannot_cancel_snoozes(pool: PgPool) {
+        let store = PgStore { pool };
+        private_group_alert(&store, "private snooze", true).await;
+        let source = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        start_delivery(&store, &source).await;
+        assert!(store
+            .record_alert_delivery(source.id, source.claim_generation, -100, 704)
+            .await
+            .unwrap());
+        let snooze = match store
+            .create_snooze_with_limits(
+                source.id,
+                source.user_id,
+                source.chat_id,
+                704,
+                Utc::now() + chrono::Duration::minutes(5),
+                AlertLimits {
+                    max_per_user: 100,
+                    max_per_chat: 50,
+                    max_per_user_chat: 10,
+                },
+            )
+            .await
+            .unwrap()
+        {
+            CreateSnoozeOutcome::Created(alert) => alert,
+            outcome => panic!("expected snooze creation, got {outcome:?}"),
+        };
+
+        // Both /cancel and forged cancel/stop callbacks reach this boundary
+        // with the same override flag after the Telegram administrator check.
+        assert_eq!(
+            store
+                .cancel_alert(snooze.id, 7, -100, &ChatType::Group, true)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::NotCancellable
+        );
+        assert_eq!(
+            store
+                .cancel_alert(snooze.id, 42, -100, &ChatType::Group, false)
                 .await
                 .unwrap(),
             CancelAlertOutcome::Cancelled
