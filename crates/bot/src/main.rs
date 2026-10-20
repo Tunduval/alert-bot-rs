@@ -498,40 +498,43 @@ fn spawn_signal_handler(
 #[cfg(test)]
 mod supervision_tests {
     use super::*;
-    use serde_json::json;
     use std::future::pending;
     use std::time::Duration;
 
     fn message_update(chat_id: i64, chat_type: &str) -> Update {
-        serde_json::from_value(json!({
-            "update_id": 1,
-            "message": {
-                "message_id": 1,
-                "date": 1,
-                "chat": { "id": chat_id, "type": chat_type },
-                "from": { "id": 7, "is_bot": false, "first_name": "Ada" },
-                "text": "/help"
-            }
-        }))
+        serde_json::from_str(&format!(
+            r#"{{
+                "update_id": 1,
+                "message": {{
+                    "message_id": 1,
+                    "date": 1,
+                    "chat": {{ "id": {chat_id}, "type": "{chat_type}" }},
+                    "from": {{ "id": 7, "is_bot": false, "first_name": "Ada" }},
+                    "text": "/help"
+                }}
+            }}"#
+        ))
         .unwrap()
     }
 
     fn callback_update(chat_id: i64) -> Update {
-        serde_json::from_value(json!({
-            "update_id": 2,
-            "callback_query": {
-                "id": "callback-id",
-                "from": { "id": 7, "is_bot": false, "first_name": "Ada" },
-                "chat_instance": "instance-id",
-                "message": {
-                    "message_id": 2,
-                    "date": 1,
-                    "chat": { "id": chat_id, "type": "supergroup" },
-                    "text": "alert"
-                },
-                "data": "cancel:1"
-            }
-        }))
+        serde_json::from_str(&format!(
+            r#"{{
+                "update_id": 2,
+                "callback_query": {{
+                    "id": "callback-id",
+                    "from": {{ "id": 7, "is_bot": false, "first_name": "Ada" }},
+                    "chat_instance": "instance-id",
+                    "message": {{
+                        "message_id": 2,
+                        "date": 1,
+                        "chat": {{ "id": {chat_id}, "type": "supergroup" }},
+                        "text": "alert"
+                    }},
+                    "data": "cancel:1"
+                }}
+            }}"#
+        ))
         .unwrap()
     }
 
@@ -679,17 +682,19 @@ mod supervision_tests {
 
     #[test]
     fn sender_chat_messages_remain_rejected() {
-        let update: Update = serde_json::from_value(json!({
-            "update_id": 3,
-            "message": {
-                "message_id": 3,
-                "date": 1,
-                "chat": { "id": -42, "type": "group" },
-                "from": { "id": 7, "is_bot": false, "first_name": "Ada" },
-                "sender_chat": { "id": -100, "type": "channel" },
-                "text": "/help"
-            }
-        }))
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 3,
+                "message": {
+                    "message_id": 3,
+                    "date": 1,
+                    "chat": { "id": -42, "type": "group" },
+                    "from": { "id": 7, "is_bot": false, "first_name": "Ada" },
+                    "sender_chat": { "id": -100, "type": "channel" },
+                    "text": "/help"
+                }
+            }"#,
+        )
         .unwrap();
 
         assert_eq!(ingress_user_id(&update), None);
