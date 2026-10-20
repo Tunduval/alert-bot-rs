@@ -664,6 +664,10 @@ async fn clear_inline_buttons(bot: &Bot, query: &CallbackQuery) {
 // ---------------------------------------------------------------------------
 
 pub async fn handle_unhandled(bot: Bot, msg: Message, store: Arc<PgStore>) -> HandlerResult {
+    if let Some((from, to)) = chat_migration(&msg) {
+        store.migrate_chat(from.0, to.0).await?;
+        return Ok(());
+    }
     if !matches!(msg.chat.kind, ChatKind::Private(_)) {
         return Ok(());
     }
@@ -686,6 +690,15 @@ pub async fn handle_unhandled(bot: Bot, msg: Message, store: Arc<PgStore>) -> Ha
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Telegram announces a group-to-supergroup upgrade in both chats: the old
+/// group gets `migrate_to_chat_id`, the new supergroup `migrate_from_chat_id`.
+fn chat_migration(msg: &Message) -> Option<(ChatId, ChatId)> {
+    if let Some(to) = msg.migrate_to_chat_id() {
+        return Some((msg.chat.id, *to));
+    }
+    msg.migrate_from_chat_id().map(|from| (*from, msg.chat.id))
+}
 
 fn chat_type_from_msg(msg: &Message) -> ChatType {
     match &msg.chat.kind {
@@ -745,5 +758,38 @@ mod tests {
         let row = &kb.inline_keyboard[0];
         assert_eq!(row.len(), 4);
         assert_eq!(callback_data(&row[3]), "stop_series:7");
+    }
+
+    fn service_message(chat: serde_json::Value, field: &str, id: i64) -> Message {
+        let mut message = serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": chat,
+            "from": {"id": 42, "is_bot": false, "first_name": "Ada"},
+        });
+        message[field] = id.into();
+        serde_json::from_str(&message.to_string()).unwrap()
+    }
+
+    #[test]
+    fn chat_migration_is_read_from_both_service_messages() {
+        let old = service_message(
+            serde_json::json!({"id": -100, "type": "group", "title": "Team"}),
+            "migrate_to_chat_id",
+            -1_001_234,
+        );
+        assert_eq!(
+            chat_migration(&old),
+            Some((ChatId(-100), ChatId(-1_001_234)))
+        );
+        let new = service_message(
+            serde_json::json!({"id": -1_001_234, "type": "supergroup", "title": "Team"}),
+            "migrate_from_chat_id",
+            -100,
+        );
+        assert_eq!(
+            chat_migration(&new),
+            Some((ChatId(-100), ChatId(-1_001_234)))
+        );
     }
 }
