@@ -136,10 +136,11 @@ async fn create_alert(
         .await?;
         return Ok(());
     }
-    if chat_type.is_group()
-        && !group_alert_creation_allowed(bot, msg.chat.id, user.language).await?
-    {
-        return Ok(());
+    if chat_type.is_group() {
+        let requester = UserId(u64::try_from(user.telegram_id)?);
+        if !group_alert_creation_allowed(bot, msg.chat.id, requester, user.language).await? {
+            return Ok(());
+        }
     }
     let new = NewAlert {
         user_id: user.telegram_id,
@@ -583,12 +584,11 @@ fn bot_user_id(bot: &Bot) -> Option<UserId> {
 async fn group_alert_creation_allowed(
     bot: &Bot,
     chat_id: ChatId,
+    requester: UserId,
     lang: Language,
 ) -> Result<bool, teloxide::RequestError> {
-    let message = match bot_group_authority(bot, chat_id).await {
-        BotGroupAuthority::Privileged => return Ok(true),
-        BotGroupAuthority::NotPrivileged => m::group_alert_bot_admin_required(lang),
-        BotGroupAuthority::Unavailable => m::group_alert_bot_admin_check_failed(lang),
+    let Some(message) = group_creation_denial(bot, chat_id, requester, lang).await else {
+        return Ok(true);
     };
     bot.send_message(chat_id, message).await?;
     Ok(false)
@@ -598,18 +598,43 @@ async fn group_snooze_creation_allowed(
     bot: &Bot,
     query: &CallbackQuery,
     chat_id: ChatId,
+    requester: UserId,
     lang: Language,
 ) -> Result<bool, teloxide::RequestError> {
-    let message = match bot_group_authority(bot, chat_id).await {
-        BotGroupAuthority::Privileged => return Ok(true),
-        BotGroupAuthority::NotPrivileged => m::group_alert_bot_admin_required(lang),
-        BotGroupAuthority::Unavailable => m::group_alert_bot_admin_check_failed(lang),
+    let Some(message) = group_creation_denial(bot, chat_id, requester, lang).await else {
+        return Ok(true);
     };
     bot.answer_callback_query(query.id.clone())
         .text(message)
         .show_alert(true)
         .await?;
     Ok(false)
+}
+
+async fn group_creation_denial(
+    bot: &Bot,
+    chat_id: ChatId,
+    requester: UserId,
+    lang: Language,
+) -> Option<&'static str> {
+    // Telegram and PostgreSQL cannot participate in one transaction. Keep both
+    // remote authority checks at the last practical boundary before the write;
+    // a membership change after a successful response remains unavoidable.
+    match bot_group_authority(bot, chat_id).await {
+        BotGroupAuthority::Privileged => {}
+        BotGroupAuthority::NotPrivileged => {
+            return Some(m::group_alert_bot_admin_required(lang));
+        }
+        BotGroupAuthority::Unavailable => {
+            return Some(m::group_alert_bot_admin_check_failed(lang));
+        }
+    }
+
+    match shared_membership(bot, chat_id, requester).await {
+        SharedMembership::Current => None,
+        SharedMembership::NotCurrent => Some(m::group_creation_membership_required(lang)),
+        SharedMembership::Unavailable => Some(m::group_creation_membership_check_failed(lang)),
+    }
 }
 
 /// Resolve authority for a private cancellation. The exact origin check comes
@@ -856,8 +881,14 @@ async fn handle_snooze_callback(
     };
     let origin_chat_type = chat_type_from_chat(origin_message.chat());
     if origin_chat_type.is_group()
-        && !group_snooze_creation_allowed(bot, query, origin_message.chat().id, user.language)
-            .await?
+        && !group_snooze_creation_allowed(
+            bot,
+            query,
+            origin_message.chat().id,
+            query.from.id,
+            user.language,
+        )
+        .await?
     {
         return Ok(());
     }
@@ -1219,7 +1250,8 @@ mod tests {
     }
 
     async fn group_creation_from_mock(
-        membership_response: &'static str,
+        bot_response: &'static str,
+        requester_response: &'static str,
         lang: Language,
     ) -> (bool, Vec<(String, String)>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1231,12 +1263,17 @@ mod tests {
                 let body = axum::body::to_bytes(request.into_body(), usize::MAX)
                     .await
                     .unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
                 captured
                     .lock()
                     .unwrap()
-                    .push((path.clone(), String::from_utf8(body.to_vec()).unwrap()));
+                    .push((path.clone(), body.clone()));
                 if path.ends_with("/GetChatMember") {
-                    membership_response
+                    if body.contains("\"user_id\":123") {
+                        bot_response
+                    } else {
+                        requester_response
+                    }
                 } else {
                     r#"{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":-100,"type":"group"},"text":"status"}}"#
                 }
@@ -1250,6 +1287,7 @@ mod tests {
         let allowed = group_alert_creation_allowed(
             &Bot::new("123:test").set_api_url(url),
             ChatId(-100),
+            UserId(42),
             lang,
         )
         .await
@@ -1261,7 +1299,8 @@ mod tests {
     }
 
     async fn group_snooze_from_mock(
-        membership_response: &'static str,
+        bot_response: &'static str,
+        requester_response: &'static str,
         lang: Language,
     ) -> (bool, Vec<(String, String)>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1273,12 +1312,14 @@ mod tests {
                 let body = axum::body::to_bytes(request.into_body(), usize::MAX)
                     .await
                     .unwrap();
-                captured
-                    .lock()
-                    .unwrap()
-                    .push((path.clone(), String::from_utf8(body.to_vec()).unwrap()));
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                captured.lock().unwrap().push((path.clone(), body.clone()));
                 if path.ends_with("/GetChatMember") {
-                    membership_response
+                    if body.contains("\"user_id\":123") {
+                        bot_response
+                    } else {
+                        requester_response
+                    }
                 } else {
                     r#"{"ok":true,"result":true}"#
                 }
@@ -1303,6 +1344,7 @@ mod tests {
             &Bot::new("123:test").set_api_url(url),
             &query,
             ChatId(-100),
+            UserId(42),
             lang,
         )
         .await
@@ -1391,17 +1433,22 @@ mod tests {
     #[tokio::test]
     async fn group_creation_accepts_only_when_bot_is_administrator() {
         let administrator = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"administrator","can_be_edited":false,"is_anonymous":false,"can_manage_chat":true,"can_delete_messages":false,"can_manage_video_chats":false,"can_restrict_members":false,"can_promote_members":false,"can_change_info":false,"can_invite_users":false}}"#;
-        let (allowed, requests) = group_creation_from_mock(administrator, Language::En).await;
+        let current = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Ada"},"status":"member"}}"#;
+        let (allowed, requests) =
+            group_creation_from_mock(administrator, current, Language::En).await;
         assert!(allowed);
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert!(requests[0].0.ends_with("/GetChatMember"));
         assert!(requests[0].1.contains("123"));
+        assert!(requests[1].0.ends_with("/GetChatMember"));
+        assert!(requests[1].1.contains("42"));
     }
 
     #[tokio::test]
     async fn group_creation_rejects_non_administrator_bot() {
         let member = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"member"}}"#;
-        let (allowed, requests) = group_creation_from_mock(member, Language::De).await;
+        let current = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Ada"},"status":"member"}}"#;
+        let (allowed, requests) = group_creation_from_mock(member, current, Language::De).await;
         assert!(!allowed);
         assert_eq!(requests.len(), 2);
         assert!(requests[1].0.ends_with("/SendMessage"));
@@ -1413,13 +1460,41 @@ mod tests {
     #[tokio::test]
     async fn group_creation_fails_closed_when_bot_role_lookup_fails() {
         let error = r#"{"ok":false,"error_code":400,"description":"Bad Request"}"#;
-        let (allowed, requests) = group_creation_from_mock(error, Language::En).await;
+        let current = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Ada"},"status":"member"}}"#;
+        let (allowed, requests) = group_creation_from_mock(error, current, Language::En).await;
         assert!(!allowed);
         assert_eq!(requests.len(), 2);
         assert!(requests[1].0.ends_with("/SendMessage"));
         assert!(requests[1]
             .1
             .contains(m::group_alert_bot_admin_check_failed(Language::En)));
+    }
+
+    #[tokio::test]
+    async fn group_creation_rejects_requester_reported_as_left() {
+        let administrator = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"administrator","can_be_edited":false,"is_anonymous":false,"can_manage_chat":true,"can_delete_messages":false,"can_manage_video_chats":false,"can_restrict_members":false,"can_promote_members":false,"can_change_info":false,"can_invite_users":false}}"#;
+        let left = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Ada"},"status":"left"}}"#;
+        let (allowed, requests) = group_creation_from_mock(administrator, left, Language::De).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].1.contains("42"));
+        assert!(requests[2].0.ends_with("/SendMessage"));
+        assert!(requests[2]
+            .1
+            .contains(m::group_creation_membership_required(Language::De)));
+    }
+
+    #[tokio::test]
+    async fn group_creation_fails_closed_when_requester_lookup_fails() {
+        let administrator = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"administrator","can_be_edited":false,"is_anonymous":false,"can_manage_chat":true,"can_delete_messages":false,"can_manage_video_chats":false,"can_restrict_members":false,"can_promote_members":false,"can_change_info":false,"can_invite_users":false}}"#;
+        let error = r#"{"ok":false,"error_code":400,"description":"Bad Request"}"#;
+        let (allowed, requests) =
+            group_creation_from_mock(administrator, error, Language::En).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2]
+            .1
+            .contains(m::group_creation_membership_check_failed(Language::En)));
     }
 
     #[test]
@@ -1432,7 +1507,8 @@ mod tests {
     #[tokio::test]
     async fn group_snooze_rejects_demoted_bot_before_creation() {
         let member = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"member"}}"#;
-        let (allowed, requests) = group_snooze_from_mock(member, Language::De).await;
+        let current = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Ada"},"status":"member"}}"#;
+        let (allowed, requests) = group_snooze_from_mock(member, current, Language::De).await;
         assert!(!allowed);
         assert_eq!(requests.len(), 2);
         assert!(requests[0].0.ends_with("/GetChatMember"));
@@ -1445,13 +1521,27 @@ mod tests {
     #[tokio::test]
     async fn group_snooze_fails_closed_when_bot_role_lookup_fails() {
         let error = r#"{"ok":false,"error_code":400,"description":"Bad Request"}"#;
-        let (allowed, requests) = group_snooze_from_mock(error, Language::En).await;
+        let current = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Ada"},"status":"member"}}"#;
+        let (allowed, requests) = group_snooze_from_mock(error, current, Language::En).await;
         assert!(!allowed);
         assert_eq!(requests.len(), 2);
         assert!(requests[1].0.ends_with("/AnswerCallbackQuery"));
         assert!(requests[1]
             .1
             .contains(m::group_alert_bot_admin_check_failed(Language::En)));
+    }
+
+    #[tokio::test]
+    async fn group_snooze_rejects_owner_reported_as_left() {
+        let administrator = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"administrator","can_be_edited":false,"is_anonymous":false,"can_manage_chat":true,"can_delete_messages":false,"can_manage_video_chats":false,"can_restrict_members":false,"can_promote_members":false,"can_change_info":false,"can_invite_users":false}}"#;
+        let left = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Ada"},"status":"left"}}"#;
+        let (allowed, requests) = group_snooze_from_mock(administrator, left, Language::En).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].0.ends_with("/AnswerCallbackQuery"));
+        assert!(requests[2]
+            .1
+            .contains(m::group_creation_membership_required(Language::En)));
     }
 
     #[tokio::test]

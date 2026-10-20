@@ -535,6 +535,28 @@ pub fn group_alert_bot_admin_check_failed(lang: Language) -> &'static str {
     }
 }
 
+pub fn group_creation_membership_required(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Nur aktuelle Gruppenmitglieder dürfen hier Reminder anlegen. Es wurde nichts angelegt."
+        }
+        Language::En => {
+            "Only current group members may create reminders here. Nothing was created."
+        }
+    }
+}
+
+pub fn group_creation_membership_check_failed(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Ich konnte deine aktuelle Gruppenmitgliedschaft nicht prüfen. Es wurde nichts angelegt."
+        }
+        Language::En => {
+            "I couldn't verify your current group membership. Nothing was created."
+        }
+    }
+}
+
 pub fn cancel_not_found(lang: Language) -> &'static str {
     match lang {
         Language::De => "Reminder nicht gefunden.",
