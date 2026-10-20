@@ -133,6 +133,11 @@ Pick the non-Alpine variant. The size difference is irrelevant on a
 dedicated DB LXC and Debian's glibc matches what GitHub Actions produces
 for the bot binary. Defaults are fine (2 CPU / 2 GB / 8 GB disk).
 
+Use PostgreSQL 16.15, 17.11, 18.6, or a later minor release of those major
+versions. Older releases lack the security fixes of 2026-08-13. Update the
+LXC's packages if the installed minor version is older. The same floors apply
+to the client package that provides `pg_dump`.
+
 Note the LXC's IP — the script prints it at the end.
 
 #### 2. Postgres role + database + system user
