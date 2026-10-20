@@ -117,6 +117,12 @@ impl PgStore {
             // the complete pool indefinitely.
             .after_connect(|connection, _meta| {
                 Box::pin(async move {
+                    let version_num: i32 =
+                        sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+                            .fetch_one(&mut *connection)
+                            .await?;
+                    server_version::require_supported(version_num)
+                        .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
                     sqlx::query("SET lock_timeout = '5s'")
                         .execute(&mut *connection)
                         .await?;
@@ -128,11 +134,6 @@ impl PgStore {
             })
             .connect(url)
             .await?;
-        let version_num: i32 =
-            sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
-                .fetch_one(&pool)
-                .await?;
-        server_version::require_supported(version_num)?;
         Ok(Self { pool })
     }
 
