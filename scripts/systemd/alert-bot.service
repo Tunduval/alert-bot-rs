@@ -6,7 +6,7 @@ Wants=network-online.target
 Requires=postgresql.service
 
 [Service]
-Type=simple
+Type=exec
 User=alertbot
 Group=alertbot
 EnvironmentFile=/etc/alert-bot/config.env
@@ -17,21 +17,32 @@ RestartSec=5s
 
 # Hardening — bot is a network client, doesn't need disk write outside of journald
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
 ProtectControlGroups=true
+ProtectProc=invisible
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+UMask=0077
 
 # Resource caps — bot baseline is tiny; raise if you see OOMs
 MemoryMax=256M
+CPUQuota=100%
 TasksMax=64
+LimitNOFILE=256
 
 [Install]
 WantedBy=multi-user.target

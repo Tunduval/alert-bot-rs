@@ -163,14 +163,27 @@ files and a config file. Copy them over the first time:
 
 ```bash
 # from your dev machine
-scp scripts/systemd/alert-bot.service       root@<lxc-ip>:/etc/systemd/system/
-scp scripts/systemd/alertbot-backup.service root@<lxc-ip>:/etc/systemd/system/
-scp scripts/systemd/alertbot-backup.timer   root@<lxc-ip>:/etc/systemd/system/
-scp scripts/backup-postgres.sh              root@<lxc-ip>:/usr/local/bin/alertbot-backup.sh
+ssh root@<lxc-ip> install -d -o root -g root -m 0700 /root/alertbot-install
+scp scripts/systemd/alert-bot.service       root@<lxc-ip>:/root/alertbot-install/
+scp scripts/systemd/alertbot-backup.service root@<lxc-ip>:/root/alertbot-install/
+scp scripts/systemd/alertbot-backup.timer   root@<lxc-ip>:/root/alertbot-install/
+scp scripts/backup-postgres.sh              root@<lxc-ip>:/root/alertbot-install/
+scp scripts/alertbot-deploy-receiver.sh     root@<lxc-ip>:/root/alertbot-install/
 ```
 
 ```bash
 # on the LXC
+install -o root -g root -m 0644 /root/alertbot-install/alert-bot.service \
+    /etc/systemd/system/alert-bot.service
+install -o root -g root -m 0644 /root/alertbot-install/alertbot-backup.service \
+    /etc/systemd/system/alertbot-backup.service
+install -o root -g root -m 0644 /root/alertbot-install/alertbot-backup.timer \
+    /etc/systemd/system/alertbot-backup.timer
+install -o root -g root -m 0755 /root/alertbot-install/backup-postgres.sh \
+    /usr/local/bin/alertbot-backup.sh
+install -o root -g root -m 0755 /root/alertbot-install/alertbot-deploy-receiver.sh \
+    /usr/local/sbin/alertbot-deploy-receiver.sh
+
 mkdir -p /etc/alert-bot
 cat > /etc/alert-bot/config.env <<EOF
 BOT_TOKEN=<from BotFather>
@@ -183,7 +196,6 @@ EOF
 chmod 600 /etc/alert-bot/config.env
 chown -R alertbot:alertbot /etc/alert-bot
 
-chmod +x /usr/local/bin/alertbot-backup.sh
 systemctl daemon-reload
 ```
 
@@ -192,21 +204,17 @@ The bot isn't installed yet — that's step 4.
 #### 4. Install the first binary
 
 Until CI is wired up (step 7), build on a Linux machine compatible with the
-LXC architecture and glibc, then scp the binary across. CI later builds on
-Ubuntu and copies directly from the runner (step 7).
+LXC architecture and glibc, then stream the binary through the restricted
+deploy receiver. CI later uses the same path (step 7).
 
 ```bash
 # on the compatible Linux build machine
 cargo build --release --bin alert-bot
 strip target/release/alert-bot
-scp target/release/alert-bot root@<lxc-ip>:/tmp/alert-bot
-```
+ssh root@<lxc-ip> env -i /usr/local/sbin/alertbot-deploy-receiver.sh \
+    < target/release/alert-bot
 
-```bash
 # on the LXC
-install -m 0755 -o root -g root /tmp/alert-bot /usr/local/bin/alert-bot
-rm /tmp/alert-bot
-
 systemctl enable --now alert-bot
 systemctl status alert-bot --no-pager -l
 journalctl -u alert-bot -n 30
@@ -224,7 +232,7 @@ schema is materialised on first boot.
 > `cargo zigbuild --target x86_64-unknown-linux-gnu --release` (needs
 > `brew install zig && cargo install cargo-zigbuild`), or just push the
 > commit and let the CI workflow do the build for you — the workflow
-> scp's straight to the LXC after build.
+> streams the artifact to the restricted LXC receiver after build.
 
 #### 5. Cloudflare Tunnel route → webhook switch
 
@@ -278,11 +286,95 @@ systemctl start alert-bot
 The GitHub Actions workflow connects to the LXC over Cloudflare Access
 SSH — no SSH port needs to be exposed on the LXC.
 
+Permit TCP port 22 on the internal bridge only from the cloudflared LXC and an
+explicit management source. After bootstrap, verify `sshd -T`, disable password
+authentication and direct root login, and remove the old unrestricted root
+deploy key.
+
+Create an unprivileged account that exists only to enter the root-owned deploy
+receiver. The clean `env -i` boundary is inside the exact `sudoers` command, so
+SSH environment variables can never reach a root shell or interpreter.
+
+```bash
+# on the LXC
+useradd --system --home-dir /var/lib/alertbot-deploy --no-create-home \
+    --shell /bin/sh alertbot-deploy
+install -d -o root -g root -m 0755 /var/lib/alertbot-deploy
+install -d -o root -g root -m 0755 /var/lib/alertbot-deploy/.ssh
+install -o root -g root -m 0644 /dev/null \
+    /var/lib/alertbot-deploy/.ssh/authorized_keys
+sudo -u alertbot-deploy test -r /var/lib/alertbot-deploy/.ssh/authorized_keys
+! sudo -u alertbot-deploy test -w /var/lib/alertbot-deploy/.ssh/authorized_keys
+
+cat > /etc/sudoers.d/alertbot-deploy <<'EOF'
+Defaults:alertbot-deploy env_reset,secure_path=/usr/sbin:/usr/bin:/sbin:/bin
+alertbot-deploy ALL=(root:root) NOPASSWD:NOSETENV: /usr/bin/env -i /usr/local/sbin/alertbot-deploy-receiver.sh
+EOF
+chmod 0440 /etc/sudoers.d/alertbot-deploy
+visudo -cf /etc/sudoers.d/alertbot-deploy
+```
+
+OpenSSH reads `authorized_keys` as the login user. The file contains public
+keys and must be readable by `alertbot-deploy`; root retains exclusive write
+access to the file and its parent directories.
+
+Limit this account at the SSH daemon as a second layer. Validate the complete
+server configuration before reloading it.
+
+```bash
+cat > /etc/ssh/sshd_config.d/00-alertbot-deploy.conf <<'EOF'
+# Global directive. Keep it before the Match block.
+PermitUserEnvironment no
+
+Match User alertbot-deploy
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PermitTTY no
+    DisableForwarding yes
+    PermitTunnel no
+    PermitUserRC no
+    ForceCommand /usr/bin/env -i /usr/bin/sudo -n -- /usr/bin/env -i /usr/local/sbin/alertbot-deploy-receiver.sh
+
+Match all
+EOF
+sshd -t
+sshd -T -C user=alertbot-deploy,host=localhost,addr=127.0.0.1 | \
+    grep -Ei '^(authenticationmethods|passwordauthentication|kbdinteractiveauthentication|permittty|disableforwarding|permituserrc|permittunnel|permituserenvironment|forcecommand) '
+sshd -T -C user=alertbot-deploy,host=localhost,addr=127.0.0.1 | \
+    grep -Ei '^acceptenv '
+systemctl reload ssh
+```
+
+The effective `AcceptEnv` list may contain locale variables such as `LANG` and
+`LC_*`. It must not contain a name or wildcard that can match `BASH_ENV`, `ENV`,
+or `LD_*`.
+
 **Generate a dedicated key pair** (don't reuse your personal one):
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/alertbot-deploy -C "github-actions-deploy"
-ssh-copy-id -i ~/.ssh/alertbot-deploy.pub root@<lxc-ip>
+deploy_key=$(cat ~/.ssh/alertbot-deploy.pub)
+ssh root@<lxc-ip> "printf '%s %s\\n' \
+  'restrict,command=\"/usr/bin/env -i /usr/bin/sudo -n -- /usr/bin/env -i /usr/local/sbin/alertbot-deploy-receiver.sh\"' \
+  '$deploy_key' >> /var/lib/alertbot-deploy/.ssh/authorized_keys"
+unset deploy_key
+```
+
+The forced command accepts one ELF binary of at most 64 MiB, installs it
+atomically, and restarts only `alert-bot`. It refuses concurrent deploys and
+keeps its lock under root-owned `/run/alertbot-deploy`, not the world-writable
+`/run/lock`. It refuses to run if the service unit or its non-root sandbox
+differs from the checked-in version.
+The key cannot open a shell, forward ports, run `scp`, or invoke another root
+command. If its forced shell were ever bypassed, the attacker would still be
+the unprivileged `alertbot-deploy` user and `sudo` would still allow only the
+clean-environment receiver. Test the restriction before adding the private key
+to GitHub:
+
+```bash
+ssh -i ~/.ssh/alertbot-deploy alertbot-deploy@<lxc-ip> id </dev/null
+# Expected: "deploy rejected", never uid output.
 ```
 
 **Cloudflare Tunnel → SSH route + Access policy.** Same cloudflared
@@ -297,18 +389,52 @@ instance as the webhook route:
     fresh Service Token, copy the Client ID and Client Secret (shown
     only once)
 
-**GitHub repository secrets/variables.** Settings → Secrets and variables
-→ Actions:
+**Protected GitHub environment.** Create an environment named `production`.
+Allow deployments only from `master`, require a reviewer, and enable
+**Prevent self-review**. Store the following values in that environment, not as
+repository secrets:
 
-| Type     | Name                          | Value                                    |
-|----------|-------------------------------|------------------------------------------|
-| Secret   | `LXC_SSH_KEY`                 | contents of `~/.ssh/alertbot-deploy`     |
-| Secret   | `CF_ACCESS_CLIENT_ID`         | from the Service Token                   |
-| Secret   | `CF_ACCESS_CLIENT_SECRET`     | from the Service Token                   |
-| Variable | `SSH_HOST`                    | `ssh-alert.yourdomain.de`                |
-| Variable | `SSH_USER`                    | `root`                                   |
+| Type     | Name                          | Value                                      |
+|----------|-------------------------------|--------------------------------------------|
+| Secret   | `LXC_SSH_KEY`                 | contents of `~/.ssh/alertbot-deploy`       |
+| Secret   | `LXC_SSH_KNOWN_HOSTS`         | verified `known_hosts` line for `SSH_HOST` |
+| Secret   | `CF_ACCESS_CLIENT_ID`         | from the Service Token                     |
+| Secret   | `CF_ACCESS_CLIENT_SECRET`     | from the Service Token                     |
+| Variable | `SSH_HOST`                    | `ssh-alert.yourdomain.de`                  |
+| Variable | `SSH_USER`                    | `alertbot-deploy`                          |
 
-The next code push to `master` triggers tests → build → direct scp/SSH
+Collect the LXC SSH host key over a trusted path and verify its fingerprint
+out of band before saving the complete `known_hosts` line. The workflow uses
+strict host-key checking and fails closed when the key changes.
+
+Protect `master` with a branch ruleset that requires a pull request, at least
+one approval, and the `Test` status check. Block force pushes
+and deletion. Do not exempt Renovate or another automation account from these
+rules, and disable auto-merge for changes to GitHub Actions workflows.
+
+Complete the following migration **before merging this workflow change**:
+
+1. Create and protect the `production` environment as described above.
+2. Rotate all four production secrets and store the new values only in that
+   environment.
+3. Delete every repository- and organization-level copy of those production
+   secrets that could still reach this repository.
+4. Install the checked-in service unit and deploy receiver. Create the
+   `alertbot-deploy` account, SSH policy, and exact `sudoers` rule from step 7.
+   Remove the old deploy key from root's `authorized_keys`, then verify the new
+   key cannot run `id` or open a shell.
+5. Create the branch ruleset so that changes to `master`, including workflow
+   changes, require a reviewed pull request.
+6. Cancel any still-running legacy deploy. Do not re-run an old deploy; delete
+   old runs if their continued availability is not required for audit.
+7. Set the repository variable `PRODUCTION_DEPLOY_ENABLED=true` last.
+
+The final variable is an explicit fail-closed gate. Without it the workflow
+still tests and builds `master`, but the deploy job remains skipped. Environment
+protection applies only to environment secrets; it does not protect
+repository-level secrets.
+
+The next code push to `master` triggers tests → build → restricted SSH-stream
 deployment via Cloudflare Access. There is no GitHub Release step.
 
 #### 8. Nightly off-site backup → Netcup SFTP
@@ -360,56 +486,59 @@ entire build, and only the stripped release binary (a few MB) is shipped to the
 LXC. The container stays minimal: it runs the binary and Postgres, nothing else
 — smaller footprint, smaller attack surface, faster restores.
 
-Push to `master` → GitHub Actions builds → runner scp's straight to the
-LXC and restarts. The full pipeline is in
+Pull requests run the tests. A push to protected `master` adds a release
+build and deploy. The full pipeline is in
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
 
 ```mermaid
 flowchart TD
-    trig["push to main / master<br/>(skips *.md, docs/, .gitignore)<br/>· or manual workflow_dispatch"] --> test
+    pr["pull request to master"] --> test
+    push["push to protected master"] --> test
 
     subgraph test["Job: test · ubuntu-22.04"]
         t1[checkout + Rust toolchain] --> t2[restore crate cache]
         t2 --> t3["workspace tests + PostgreSQL integration tests + backup regression tests"]
     end
 
-    test -->|"needs: test"| deploy
+    test -->|"push only"| build
 
-    subgraph deploy["Job: deploy · ubuntu-22.04 · glibc 2.35 pin"]
-        d1["cargo build --release + strip"] --> d2[install cloudflared]
-        d2 --> d3["write deploy SSH key<br/>secrets.LXC_SSH_KEY"]
-        d3 --> d4["sanity-check Cloudflare<br/>Access service token"]
-        d4 --> d5["scp binary to LXC<br/>over Cloudflare Access SSH"]
-        d5 --> d6["ssh: install + systemctl restart"]
-        d6 --> d7["tail journalctl ~20s"]
+    subgraph build["Job: build · no production secrets"]
+        b1["cargo build --release + strip"] --> b2["upload short-lived artifact"]
     end
 
-    d6 -.->|deploys onto| host[("alert-bot LXC<br/>no public SSH port")]
+    build --> deploy
+
+    subgraph deploy["Job: deploy · protected production environment"]
+        d1["download artifact"] --> d2["verify pinned cloudflared"]
+        d2 --> d3["strict SSH host-key check"]
+        d3 --> d4["stream into forced command"]
+        d4 --> d5["bounded atomic install + restart"]
+    end
+
+    d5 -.->|deploys onto| host[("alert-bot LXC<br/>no public SSH port")]
 ```
 
 1. **Test** — workspace tests, isolated PostgreSQL integration tests, and offline
    backup failure tests.
-2. **Build & deploy** (one job, so the runner can scp the binary it just
-   built):
-   1. `cargo build --release --bin alert-bot` on `ubuntu-22.04`.
-      Pinned so the binary's glibc baseline (2.35) stays compatible
-      with Debian 13 (2.41 — backward-compatible). If we let
-      `ubuntu-latest` drift past Debian, deploy silently breaks.
-   2. `strip target/release/alert-bot`
-   3. `scp` the binary to the LXC over Cloudflare Access SSH.
-   4. On the LXC: `install -m 0755` to `/usr/local/bin/alert-bot`,
-      then `systemctl restart alert-bot`.
-3. **Tail** — 20s of `journalctl -u alert-bot -f` for inspection. This currently
-   does not fail the job on a later startup error; readiness checks remain open
-   in `BACKLOG.md`.
+2. **Build** — `cargo build --release --locked --bin alert-bot` on pinned
+   `ubuntu-22.04`, then upload a one-day artifact. This job has no production
+   secrets, so project build code cannot read them.
+3. **Deploy** — after the protected `production` environment approves the job,
+   download the artifact, verify the pinned `cloudflared` binary, verify the
+   LXC host key, and stream the binary into the forced deploy command. That
+   command enforces the size and ELF format, installs atomically, restarts only
+   `alert-bot`, and requires an active unit. The deploy does not print
+   service-token details or production journals.
 
 No GitHub Release roundtrip — keeps the repo free to stay private.
 
-### Manual trigger
+### Manual redeploy
 
-The workflow has `workflow_dispatch` so you can re-deploy any commit
-from the Actions tab without pushing — useful for retrying a flaky
-deploy or re-applying after a Cloudflare config change.
+GitHub → Actions → "Build and deploy to production" → open the successful
+`master` run for the currently deployed commit → **Re-run all jobs**. This
+keeps the original commit and ref. Do not rerun runs of the previous
+workflow; cancel them and rotate their secrets. Use a revert pull request for
+an older version instead of rerunning an old workflow.
 
 ### Tail logs from your dev machine
 
@@ -424,13 +553,9 @@ Requires `LXC_HOST` exported in your shell, or set it once in
 
 ### Rollback
 
-Trigger the workflow on an older commit:
-
-- GitHub → Actions → "Build and deploy to production" → **Run
-  workflow** → pick a branch or tag → run.
-
-That rebuilds + scp's the older commit's binary. Or build locally and
-scp manually (same one-liner as step 4 in the production setup above).
+Revert the faulty change through a pull request and merge the revert into
+protected `master`. The normal pipeline then builds and deploys the reviewed
+rollback.
 
 Postgres data isn't touched by binary swaps, so code-only rollbacks are
 safe. Schema rollbacks need a `pg_dump` restore — keep your daily Netcup

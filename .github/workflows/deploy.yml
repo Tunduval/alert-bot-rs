@@ -13,7 +13,9 @@ on:
       - '**/*.md'
       - 'docs/**'
       - '.gitignore'
-  workflow_dispatch:    # manual trigger from the Actions tab
+
+permissions:
+  contents: read
 
 concurrency:
   group: deploy-${{ github.ref }}
@@ -35,6 +37,8 @@ jobs:
           --health-interval 5s --health-timeout 3s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -57,108 +61,116 @@ jobs:
           DATABASE_URL: postgres://postgres:test-only@127.0.0.1:5432/postgres
         run: cargo test --workspace -- --ignored
 
-  deploy:
-    name: Build & deploy to LXC
+  build:
+    name: Build release artifact
     needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     # Pin to ubuntu-22.04 so the binary's glibc baseline (2.35) stays
     # compatible with Debian 13 (glibc 2.41 — backward-compatible). If we
     # let GitHub bump `ubuntu-latest` past Debian, deploy silently breaks.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           prefix-key: "v3-ubuntu-22.04"
-
       - name: Build release binary
         run: |
-          cargo build --release --bin alert-bot
+          set -euo pipefail
+          cargo build --release --locked --bin alert-bot
           strip target/release/alert-bot
-          ls -lh target/release/alert-bot
+          test -f target/release/alert-bot
+          test ! -L target/release/alert-bot
+          test "$(stat -c '%s' target/release/alert-bot)" -le 67108864
+      - name: Upload release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: alert-bot-${{ github.sha }}
+          path: target/release/alert-bot
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Install cloudflared
+  deploy:
+    name: Deploy to LXC
+    needs: build
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/master' &&
+      vars.PRODUCTION_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: alert-bot-${{ github.sha }}
+          path: release
+      - name: Verify release artifact
         run: |
-          curl -fsSL \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /tmp/cloudflared
-          chmod +x /tmp/cloudflared
-          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
-          cloudflared --version
+          set -euo pipefail
+          test -f release/alert-bot
+          test ! -L release/alert-bot
+          test "$(stat -c '%s' release/alert-bot)" -le 67108864
+          chmod 0755 release/alert-bot
+
+      - name: Install pinned cloudflared
+        env:
+          CLOUDFLARED_SHA256: d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db
+          CLOUDFLARED_VERSION: 2026.10.0
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent --location \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
+            --output "$RUNNER_TEMP/cloudflared"
+          printf '%s  %s\n' "$CLOUDFLARED_SHA256" "$RUNNER_TEMP/cloudflared" | sha256sum --check --strict
+          install -m 0755 "$RUNNER_TEMP/cloudflared" "$RUNNER_TEMP/bin-cloudflared"
 
       - name: Configure SSH
         env:
           SSH_PRIVATE_KEY: ${{ secrets.LXC_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LXC_SSH_KNOWN_HOSTS }}
         run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-
-      - name: Sanity-check Cloudflare Access creds
-        env:
-          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          SSH_HOST: ${{ vars.SSH_HOST }}
-        run: |
-          echo "Hostname: $SSH_HOST"
-          echo "CF_ID length: ${#CF_ID}    (looks like X.access if ends with '.access')"
-          echo "CF_ID ends with: ...${CF_ID: -8}"
-          echo "CF_SECRET length: ${#CF_SECRET}"
-          # Hit the protected hostname with the service token via curl.
-          # 200 = creds + policy good. 403 = creds wrong or policy denies.
-          # Anything else = routing/tunnel problem.
-          code=$(curl -s -o /tmp/cf_body -w "%{http_code}" \
-               -H "CF-Access-Client-Id: $CF_ID" \
-               -H "CF-Access-Client-Secret: $CF_SECRET" \
-               "https://$SSH_HOST/" || true)
-          echo "HTTP status: $code"
-          head -c 500 /tmp/cf_body || true
-          echo
-          if [ "$code" != "200" ] && [ "$code" != "404" ] && [ "$code" != "426" ]; then
-            echo "::error::Cloudflare Access rejected the service token (status $code)"
-            exit 1
-          fi
-
-      - name: scp binary + install + restart on the LXC
-        env:
-          CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          SSH_HOST: ${{ vars.SSH_HOST }}
-          SSH_USER: ${{ vars.SSH_USER }}
-        run: |
-          # Pass service token as CLI flags rather than env vars — env var
-          # names have shifted across cloudflared releases (TUNNEL_*,
-          # CLOUDFLARED_*, CLOUDFLARE_*) and the flag form is stable.
-          PROXY="cloudflared access ssh --hostname $SSH_HOST --service-token-id $CF_ID --service-token-secret $CF_SECRET"
-
-          scp -o "ProxyCommand=$PROXY" \
-              -o "StrictHostKeyChecking=accept-new" \
-              -o "UserKnownHostsFile=/dev/null" \
-              target/release/alert-bot \
-              "$SSH_USER@$SSH_HOST:/tmp/alert-bot.new"
-
-          ssh -o "ProxyCommand=$PROXY" \
-              -o "StrictHostKeyChecking=accept-new" \
-              -o "UserKnownHostsFile=/dev/null" \
-              "$SSH_USER@$SSH_HOST" bash <<'REMOTE'
           set -euo pipefail
-          install -m 0755 -o root -g root /tmp/alert-bot.new /usr/local/bin/alert-bot
-          rm -f /tmp/alert-bot.new
-          systemctl restart alert-bot
-          systemctl is-active alert-bot
-          REMOTE
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+          ssh-keygen -l -f ~/.ssh/known_hosts >/dev/null
 
-      - name: Tail logs briefly
+      - name: Install and restart on the LXC
         env:
           CF_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           SSH_HOST: ${{ vars.SSH_HOST }}
           SSH_USER: ${{ vars.SSH_USER }}
         run: |
-          PROXY="cloudflared access ssh --hostname $SSH_HOST --service-token-id $CF_ID --service-token-secret $CF_SECRET"
-          ssh -o "ProxyCommand=$PROXY" \
-              -o "StrictHostKeyChecking=accept-new" \
-              -o "UserKnownHostsFile=/dev/null" \
-              "$SSH_USER@$SSH_HOST" \
-              "timeout 20 journalctl -u alert-bot -n 30 -f || true"
+          set -euo pipefail
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$SSH_USER" == "alertbot-deploy" ]]
+
+          cat > "$RUNNER_TEMP/cloudflared-proxy" <<'PROXY'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec "$RUNNER_TEMP/bin-cloudflared" access ssh \
+            --hostname "$SSH_HOST" \
+            --service-token-id "$CF_ID" \
+            --service-token-secret "$CF_SECRET"
+          PROXY
+          chmod 0700 "$RUNNER_TEMP/cloudflared-proxy"
+          ssh_options=(
+            -o "ProxyCommand=$RUNNER_TEMP/cloudflared-proxy"
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile=~/.ssh/known_hosts
+            -o BatchMode=yes
+            -o ConnectTimeout=20
+          )
+
+          local_sha=$(sha256sum release/alert-bot)
+          local_sha=${local_sha%% *}
+          expected="alert-bot deployed sha256=$local_sha"
+          actual=$(ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" < release/alert-bot)
+          [[ "$actual" == "$expected" ]]
