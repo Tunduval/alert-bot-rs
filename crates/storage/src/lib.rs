@@ -46,6 +46,20 @@ impl PgStore {
             // Recycle idle connections after 10 min so they don't outlive
             // postgres's own idle-in-transaction or NAT keepalive limits.
             .idle_timeout(std::time::Duration::from_secs(600))
+            // A local role can hold advisory locks even without table write
+            // privileges. Bound every application wait so it cannot consume
+            // the complete pool indefinitely.
+            .after_connect(|connection, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET lock_timeout = '5s'")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET statement_timeout = '30s'")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(url)
             .await?;
         Ok(Self { pool })
@@ -213,13 +227,14 @@ impl PgStore {
 
     /// Atomically claim up to `limit` due alerts. Multiple workers can call
     /// this concurrently — `FOR UPDATE SKIP LOCKED` guarantees no row is
-    /// claimed twice.
+    /// claimed twice. `attempts` saturates at the `SMALLINT` maximum, so an
+    /// alert that keeps being rescheduled cannot make the claim query fail.
     pub async fn claim_due_alerts(&self, limit: i64) -> Result<Vec<Alert>> {
         let rows = sqlx::query(
             r#"
             UPDATE alerts
             SET state = 'claimed',
-                attempts = attempts + 1,
+                attempts = LEAST(attempts::integer + 1, 32767),
                 claim_generation = claim_generation + 1,
                 claimed_at = now(),
                 updated_at = now()
@@ -360,6 +375,20 @@ impl PgStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
+    }
+
+    /// Telegram replaces a group's chat id when the group becomes a
+    /// supergroup. Move every alert of the old chat to the new id.
+    pub async fn migrate_chat(&self, from_chat_id: i64, to_chat_id: i64) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE alerts SET chat_id = $2, chat_type = 'supergroup', updated_at = now()
+             WHERE chat_id = $1",
+        )
+        .bind(from_chat_id)
+        .bind(to_chat_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// Earliest pending fire time, used by the worker to compute its next
@@ -641,5 +670,70 @@ mod tests {
                 .as_deref(),
             Some("failed")
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn claim_saturates_attempts_without_blocking_other_alerts(pool: PgPool) {
+        let store = PgStore { pool };
+        let exhausted = due_alert(&store, "saturated").await;
+        let healthy = due_alert(&store, "still deliver").await;
+        sqlx::query("UPDATE alerts SET attempts = 32767 WHERE id = $1")
+            .bind(exhausted.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let claimed = store.claim_due_alerts(2).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        let saturated = claimed.iter().find(|a| a.id == exhausted.id).unwrap();
+        assert_eq!(saturated.attempts, i16::MAX);
+        assert!(claimed.iter().any(|a| a.id == healthy.id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn chat_migration_moves_only_alerts_of_the_old_chat(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::De).await.unwrap();
+        let at = Utc::now() + chrono::Duration::hours(1);
+        let make = |chat_id| NewAlert {
+            user_id: 42,
+            chat_id,
+            chat_type: ChatType::Group,
+            scope: AlertScope::Shared,
+            text: "standup".into(),
+            fire_at: at,
+            schedule: Schedule::one_shot(at, chrono_tz::UTC),
+        };
+        let first = store.create_alert(make(-100)).await.unwrap();
+        let second = store.create_alert(make(-100)).await.unwrap();
+        let other = store.create_alert(make(-200)).await.unwrap();
+
+        assert_eq!(store.migrate_chat(-100, -1_001_234).await.unwrap(), 2);
+
+        for id in [first.id, second.id] {
+            let moved = store.get_alert(id).await.unwrap().unwrap();
+            assert_eq!(moved.chat_id, -1_001_234);
+            assert_eq!(moved.chat_type, ChatType::Supergroup);
+        }
+        let untouched = store.get_alert(other.id).await.unwrap().unwrap();
+        assert_eq!(untouched.chat_id, -200);
+        assert_eq!(untouched.chat_type, ChatType::Group);
+        assert_eq!(store.count_active_for_chat(-1_001_234).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn connection_applies_session_timeouts() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let store = PgStore::connect(&database_url, 1).await.unwrap();
+        let settings: (String, String) = sqlx::query_as(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(settings, ("5s".to_owned(), "30s".to_owned()));
     }
 }
