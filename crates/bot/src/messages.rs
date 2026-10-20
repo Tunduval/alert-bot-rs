@@ -403,6 +403,12 @@ pub fn parse_note(note: ParseNote, lang: Language) -> String {
         (ParseNote::MonthlyLastDay, Language::En) => {
             "Note: in months without a 31st, this fires on the last day of the month.".into()
         }
+        (ParseNote::MonthlyLastDayFrom { day }, Language::De) => format!(
+            "Hinweis: in Monaten ohne {day}. feuert der Reminder am letzten Tag des Monats."
+        ),
+        (ParseNote::MonthlyLastDayFrom { day }, Language::En) => {
+            format!("Note: in months without day {day}, this fires on the last day of the month.")
+        }
         (ParseNote::YearlyFeb29Fallback, Language::De) => {
             "Hinweis: in Nicht-Schaltjahren feuert dieser Reminder am 28.2..".into()
         }

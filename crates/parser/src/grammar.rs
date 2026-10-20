@@ -759,6 +759,15 @@ fn try_recurring_relative(
         let today = today_local(ctx);
         let (month, day) = (today.month() as u8, today.day() as u8);
         let dtstart = next_dtstart_for_yearly(month, day, time, interval, ctx);
+        if month == 2 && day == 29 {
+            let schedule =
+                Schedule::yearly_every_last_day_of_month(dtstart, ctx.tz, interval, month, time)?;
+            return Ok(Some((
+                schedule,
+                end_offset,
+                Some(ParseNote::YearlyFeb29Fallback),
+            )));
+        }
         let schedule = Schedule::yearly_every(dtstart, ctx.tz, interval, month, day, time)?;
         return Ok(Some((schedule, end_offset, None)));
     }
@@ -767,9 +776,10 @@ fn try_recurring_relative(
         let interval = u16::try_from(spec.months).map_err(|_| ParseError::InvalidRecurrenceSpec)?;
         let today = today_local(ctx);
         let day = today.day() as u8;
-        let dtstart = next_dtstart_for_monthly(day, time, interval, ctx);
-        let schedule = Schedule::monthly_every(dtstart, ctx.tz, interval, day, time)?;
-        return Ok(Some((schedule, end_offset, None)));
+        let dtstart = next_dtstart_for_monthly_or_last_day(day, time, interval, ctx);
+        let schedule = Schedule::monthly_every_or_last_day(dtstart, ctx.tz, interval, day, time)?;
+        let note = (day > 28).then_some(ParseNote::MonthlyLastDayFrom { day });
+        return Ok(Some((schedule, end_offset, note)));
     }
 
     let total_secs = spec.weeks as i64 * 7 * 86_400
@@ -1029,6 +1039,21 @@ fn next_dtstart_for_monthly(
     first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(31))
 }
 
+/// Like [`next_dtstart_for_monthly`], but a month without `day` contributes
+/// its last day, matching [`Schedule::monthly_every_or_last_day`].
+fn next_dtstart_for_monthly_or_last_day(
+    day: u8,
+    time: NaiveTime,
+    interval: u16,
+    ctx: &ParseContext,
+) -> DateTime<Utc> {
+    let local_now = ctx.now_utc.with_timezone(&ctx.tz);
+    let candidates = month_iter(local_now.year(), local_now.month(), interval, 14).filter_map(
+        |(y, m)| NaiveDate::from_ymd_opt(y, m, (day as u32).min(last_day_of_month(y, m))),
+    );
+    first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(31))
+}
+
 fn next_dtstart_for_monthly_last_day(time: NaiveTime, ctx: &ParseContext) -> DateTime<Utc> {
     let local_now = ctx.now_utc.with_timezone(&ctx.tz);
     let candidates = month_iter(local_now.year(), local_now.month(), 1, 14)
@@ -1047,8 +1072,15 @@ fn next_dtstart_for_yearly(
 ) -> DateTime<Utc> {
     let base_year = ctx.now_utc.with_timezone(&ctx.tz).year();
     let step = interval.max(1) as i32;
-    let candidates = (0..5)
-        .filter_map(|n| NaiveDate::from_ymd_opt(base_year + n * step, month as u32, day as u32));
+    // Feb 29 falls back to Feb 28 in non-leap years.
+    let candidates = (0..5).filter_map(|n| {
+        let y = base_year + n * step;
+        NaiveDate::from_ymd_opt(
+            y,
+            month as u32,
+            (day as u32).min(last_day_of_month(y, month as u32)),
+        )
+    });
     first_future_dtstart(candidates, time, ctx, ctx.now_utc + Duration::days(365))
 }
 

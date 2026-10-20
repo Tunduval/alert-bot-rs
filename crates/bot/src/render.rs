@@ -125,7 +125,9 @@ pub fn format_recurrence_short(schedule: &Schedule, lang: Language) -> Option<St
             }
         }
         Frequency::Monthly => {
-            let day = rule.get_by_month_day().first().copied().unwrap_or(1);
+            // `*NM` from the 29th lists 28..=day with BYSETPOS=-1; show the
+            // requested day.
+            let day = rule.get_by_month_day().iter().copied().max().unwrap_or(1);
             match (interval, lang) {
                 (1, Language::De) => format!("jeden {day}. {hm}"),
                 (1, Language::En) => format!("monthly on {day}. {hm}"),
@@ -192,3 +194,23 @@ fn month_name_short(m: u32, lang: Language) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{NaiveTime, TimeZone};
+
+    #[test]
+    fn monthly_fallback_rule_shows_the_requested_day() {
+        let tz: Tz = "Europe/Berlin".parse().unwrap();
+        let dtstart = tz
+            .with_ymd_and_hms(2027, 2, 28, 9, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let schedule = Schedule::monthly_every_or_last_day(dtstart, tz, 1, 30, time).unwrap();
+        assert_eq!(
+            format_recurrence_short(&schedule, Language::De).as_deref(),
+            Some("jeden 30. 09:00")
+        );
+    }
+}
