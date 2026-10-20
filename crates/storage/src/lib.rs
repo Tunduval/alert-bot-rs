@@ -213,13 +213,14 @@ impl PgStore {
 
     /// Atomically claim up to `limit` due alerts. Multiple workers can call
     /// this concurrently — `FOR UPDATE SKIP LOCKED` guarantees no row is
-    /// claimed twice.
+    /// claimed twice. `attempts` saturates at the `SMALLINT` maximum, so an
+    /// alert that keeps being rescheduled cannot make the claim query fail.
     pub async fn claim_due_alerts(&self, limit: i64) -> Result<Vec<Alert>> {
         let rows = sqlx::query(
             r#"
             UPDATE alerts
             SET state = 'claimed',
-                attempts = attempts + 1,
+                attempts = LEAST(attempts::integer + 1, 32767),
                 claim_generation = claim_generation + 1,
                 claimed_at = now(),
                 updated_at = now()
@@ -641,5 +642,24 @@ mod tests {
                 .as_deref(),
             Some("failed")
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn claim_saturates_attempts_without_blocking_other_alerts(pool: PgPool) {
+        let store = PgStore { pool };
+        let exhausted = due_alert(&store, "saturated").await;
+        let healthy = due_alert(&store, "still deliver").await;
+        sqlx::query("UPDATE alerts SET attempts = 32767 WHERE id = $1")
+            .bind(exhausted.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let claimed = store.claim_due_alerts(2).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        let saturated = claimed.iter().find(|a| a.id == exhausted.id).unwrap();
+        assert_eq!(saturated.attempts, i16::MAX);
+        assert!(claimed.iter().any(|a| a.id == healthy.id));
     }
 }
