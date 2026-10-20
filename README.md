@@ -288,8 +288,9 @@ SSH — no SSH port needs to be exposed on the LXC.
 
 Permit TCP port 22 on the internal bridge only from the cloudflared LXC and an
 explicit management source. After bootstrap, verify `sshd -T`, disable password
-authentication and direct root login, and remove the old unrestricted root
-deploy key.
+authentication, allow root only with keys (`PermitRootLogin prohibit-password`),
+and remove the old unrestricted root deploy key. The administrative commands in
+this README, including `scripts/logs.sh`, connect as root with your own key.
 
 Create an unprivileged account that exists only to enter the root-owned deploy
 receiver. The clean `env -i` boundary is inside the exact `sudoers` command, so
@@ -409,7 +410,10 @@ strict host-key checking and fails closed when the key changes.
 
 Protect `master` with a branch ruleset that requires a pull request, at least
 one approval, and the `Test` status check. Block force pushes
-and deletion. Do not exempt Renovate or another automation account from these
+and deletion. The workflow skips pull requests that change only Markdown,
+`docs/**` or `.gitignore`, so such a pull request never reports `Test` and
+stays blocked; remove `paths-ignore` from the `pull_request` trigger or merge
+those pull requests through a ruleset bypass. Do not exempt Renovate or another automation account from these
 rules, and disable auto-merge for changes to GitHub Actions workflows.
 
 Complete the following migration **before merging this workflow change**:
