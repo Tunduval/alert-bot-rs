@@ -648,7 +648,11 @@ async fn handle_cancel_callback(
     let ok = store.cancel_alert(alert_id, requester).await?;
 
     if ok {
-        if let Some(msg) = query.message.as_ref().filter(|_| source_message_offers(query)) {
+        if let Some(msg) = query
+            .message
+            .as_ref()
+            .filter(|_| source_message_offers(query))
+        {
             bot.edit_message_text(msg.chat().id, msg.id(), m::cancelled_inline(lang, alert_id))
                 .await
                 .ok();
@@ -813,9 +817,9 @@ fn source_message_offers(query: &CallbackQuery) -> bool {
         return false;
     };
     msg.reply_markup().is_some_and(|markup| {
-        markup.inline_keyboard.iter().flatten().any(|button| {
-            matches!(&button.kind, InlineKeyboardButtonKind::CallbackData(d) if d == data)
-        })
+        markup.inline_keyboard.iter().flatten().any(
+            |button| matches!(&button.kind, InlineKeyboardButtonKind::CallbackData(d) if d == data),
+        )
     })
 }
 
@@ -824,7 +828,11 @@ fn source_message_offers(query: &CallbackQuery) -> bool {
 /// failures (most common one being a message older than Telegram's 48h edit
 /// window).
 async fn clear_inline_buttons(bot: &Bot, query: &CallbackQuery) {
-    if let Some(msg) = query.message.as_ref().filter(|_| source_message_offers(query)) {
+    if let Some(msg) = query
+        .message
+        .as_ref()
+        .filter(|_| source_message_offers(query))
+    {
         let empty: InlineKeyboardMarkup =
             InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new());
         bot.edit_message_reply_markup(msg.chat().id, msg.id())
