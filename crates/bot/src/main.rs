@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use teloxide::dispatching::ShutdownToken;
-use teloxide::update_listeners::webhooks;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, Me, UpdateKind};
 use teloxide::utils::command::BotCommands;
@@ -16,6 +15,7 @@ use url::Url;
 use storage::PgStore;
 
 mod admin;
+mod bounded_http;
 mod commands;
 mod handlers;
 mod identity;
@@ -23,6 +23,7 @@ mod limits;
 mod messages;
 mod render;
 mod stats;
+mod webhook;
 mod worker;
 
 use admin::AdminNotifier;
@@ -68,13 +69,15 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { worker::run(bot, store, shutdown).await })
     };
 
-    // Opt-in read-only stats endpoint (Homepage widget). Separate axum server
-    // on its own LAN-only port — doesn't touch the webhook listener below.
-    if let Some(addr) = config.stats_listen {
+    // Opt-in authenticated stats endpoint (Homepage widget). Its separate
+    // axum server doesn't touch the webhook listener below.
+    if let Some(stats_config) = config.stats {
         let store = store.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = stats::run(store, addr, shutdown).await {
+            if let Err(e) =
+                stats::run(store, stats_config.listen, stats_config.token, shutdown).await
+            {
                 tracing::error!(error = ?e, "stats server exited with error");
             }
         });
@@ -145,11 +148,7 @@ async fn main() -> Result<()> {
                 url,
                 secret,
             } => {
-                let mut options = webhooks::Options::new(listen, url);
-                if let Some(s) = secret {
-                    options = options.secret_token(s);
-                }
-                let listener = webhooks::axum(bot.clone(), options)
+                let (listener, server) = webhook::start(bot.clone(), listen, url, secret)
                     .await
                     .context("setting up webhook listener")?;
                 dispatcher
@@ -158,6 +157,7 @@ async fn main() -> Result<()> {
                         LoggingErrorHandler::with_custom_text("webhook listener error"),
                     )
                     .await;
+                server.await.context("webhook server task failed")??;
             }
             Transport::Polling => {
                 // Local-dev fallback. Requires no public endpoint.
@@ -266,16 +266,21 @@ struct Config {
     database_url: String,
     transport: Transport,
     admin_chat_id: Option<i64>,
-    /// Optional LAN-only address for the read-only `/stats` endpoint. `None`
-    /// (env unset) means the stats server doesn't start at all.
-    stats_listen: Option<SocketAddr>,
+    /// Optional authenticated `/stats` endpoint. `None` means the stats
+    /// server doesn't start at all.
+    stats: Option<StatsConfig>,
+}
+
+struct StatsConfig {
+    listen: SocketAddr,
+    token: String,
 }
 
 enum Transport {
     Webhook {
         listen: SocketAddr,
         url: Url,
-        secret: Option<String>,
+        secret: String,
     },
     Polling,
 }
@@ -285,11 +290,15 @@ enum Transport {
 impl std::fmt::Debug for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Transport::Webhook { listen, url, secret } => f
+            Transport::Webhook {
+                listen,
+                url,
+                secret: _,
+            } => f
                 .debug_struct("Webhook")
                 .field("listen", listen)
                 .field("url", &url.as_str())
-                .field("secret", &secret.as_ref().map(|_| "<redacted>"))
+                .field("secret", &"<redacted>")
                 .finish(),
             Transport::Polling => f.write_str("Polling"),
         }
@@ -309,8 +318,14 @@ impl Config {
                     .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
                     .parse()
                     .context("WEBHOOK_LISTEN is not a valid socket address")?;
-                let secret = std::env::var("WEBHOOK_SECRET").ok().filter(|s| !s.is_empty());
-                Transport::Webhook { listen, url, secret }
+                let secret = std::env::var("WEBHOOK_SECRET")
+                    .context("WEBHOOK_SECRET is required in webhook mode")?;
+                validate_webhook_secret(&secret)?;
+                Transport::Webhook {
+                    listen,
+                    url,
+                    secret,
+                }
             }
         };
 
@@ -322,22 +337,62 @@ impl Config {
             ),
         };
 
-        let stats_listen = match std::env::var("STATS_LISTEN").ok().filter(|s| !s.is_empty()) {
-            None => None,
-            Some(s) => Some(
-                s.parse::<SocketAddr>()
-                    .context("STATS_LISTEN is not a valid socket address")?,
-            ),
-        };
+        let stats = parse_stats_config(
+            std::env::var("STATS_LISTEN").ok().filter(|s| !s.is_empty()),
+            std::env::var("STATS_TOKEN").ok(),
+        )?;
 
         Ok(Self {
             bot_token,
             database_url,
             transport,
             admin_chat_id,
-            stats_listen,
+            stats,
         })
     }
+}
+
+fn validate_webhook_secret(secret: &str) -> Result<()> {
+    anyhow::ensure!(
+        (32..=256).contains(&secret.len()),
+        "WEBHOOK_SECRET must contain 32 to 256 characters"
+    );
+    anyhow::ensure!(
+        secret
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "WEBHOOK_SECRET may only contain A-Z, a-z, 0-9, _ and -"
+    );
+    Ok(())
+}
+
+fn validate_stats_token(token: &str) -> Result<()> {
+    anyhow::ensure!(
+        (32..=256).contains(&token.len()),
+        "STATS_TOKEN must contain 32 to 256 characters"
+    );
+    anyhow::ensure!(
+        token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "STATS_TOKEN may only contain A-Z, a-z, 0-9, _ and -"
+    );
+    Ok(())
+}
+
+fn parse_stats_config(
+    listen: Option<String>,
+    token: Option<String>,
+) -> Result<Option<StatsConfig>> {
+    let Some(listen) = listen else {
+        return Ok(None);
+    };
+    let listen = listen
+        .parse::<SocketAddr>()
+        .context("STATS_LISTEN is not a valid socket address")?;
+    let token = token.context("STATS_TOKEN is required when STATS_LISTEN is set")?;
+    validate_stats_token(&token)?;
+    Ok(Some(StatsConfig { listen, token }))
 }
 
 fn init_tracing() {
@@ -555,6 +610,32 @@ mod supervision_tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn webhook_secret_requires_telegram_charset_and_minimum_length() {
+        assert!(validate_webhook_secret("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_webhook_secret("short").is_err());
+        assert!(validate_webhook_secret("0123456789abcdef0123456789abcde!").is_err());
+    }
+
+    #[test]
+    fn stats_token_requires_safe_charset_and_minimum_length() {
+        assert!(validate_stats_token("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_stats_token("short").is_err());
+        assert!(validate_stats_token("0123456789abcdef0123456789abcde!").is_err());
+    }
+
+    #[test]
+    fn stats_listener_requires_a_strong_token() {
+        assert!(parse_stats_config(Some("0.0.0.0:8081".to_owned()), None).is_err());
+        let config = parse_stats_config(
+            Some("0.0.0.0:8081".to_owned()),
+            Some("0123456789abcdef0123456789abcdef".to_owned()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.listen, "0.0.0.0:8081".parse().unwrap());
     }
 
     #[test]
