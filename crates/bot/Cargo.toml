@@ -22,6 +22,7 @@ dotenvy.workspace = true
 governor.workspace = true
 reqwest.workspace = true
 rrule.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 teloxide.workspace = true
 tokio.workspace = true

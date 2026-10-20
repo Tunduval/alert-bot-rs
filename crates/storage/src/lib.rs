@@ -362,6 +362,20 @@ impl PgStore {
         Ok(row.0)
     }
 
+    /// Telegram replaces a group's chat id when the group becomes a
+    /// supergroup. Move every alert of the old chat to the new id.
+    pub async fn migrate_chat(&self, from_chat_id: i64, to_chat_id: i64) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE alerts SET chat_id = $2, chat_type = 'supergroup', updated_at = now()
+             WHERE chat_id = $1",
+        )
+        .bind(from_chat_id)
+        .bind(to_chat_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Earliest pending fire time, used by the worker to compute its next
     /// wake-up timer. `None` means no pending alerts at all.
     pub async fn next_pending_fire_at(&self) -> Result<Option<DateTime<Utc>>> {
@@ -641,5 +655,37 @@ mod tests {
                 .as_deref(),
             Some("failed")
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn chat_migration_moves_only_alerts_of_the_old_chat(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::De).await.unwrap();
+        let at = Utc::now() + chrono::Duration::hours(1);
+        let make = |chat_id| NewAlert {
+            user_id: 42,
+            chat_id,
+            chat_type: ChatType::Group,
+            scope: AlertScope::Shared,
+            text: "standup".into(),
+            fire_at: at,
+            schedule: Schedule::one_shot(at, chrono_tz::UTC),
+        };
+        let first = store.create_alert(make(-100)).await.unwrap();
+        let second = store.create_alert(make(-100)).await.unwrap();
+        let other = store.create_alert(make(-200)).await.unwrap();
+
+        assert_eq!(store.migrate_chat(-100, -1_001_234).await.unwrap(), 2);
+
+        for id in [first.id, second.id] {
+            let moved = store.get_alert(id).await.unwrap().unwrap();
+            assert_eq!(moved.chat_id, -1_001_234);
+            assert_eq!(moved.chat_type, ChatType::Supergroup);
+        }
+        let untouched = store.get_alert(other.id).await.unwrap().unwrap();
+        assert_eq!(untouched.chat_id, -200);
+        assert_eq!(untouched.chat_type, ChatType::Group);
+        assert_eq!(store.count_active_for_chat(-1_001_234).await.unwrap(), 2);
     }
 }

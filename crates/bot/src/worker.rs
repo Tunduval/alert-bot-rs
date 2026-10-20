@@ -8,6 +8,7 @@
 //!  3. Atomically claim one due alert via `FOR UPDATE SKIP LOCKED`.
 //!  4. For each: send via Bot API, mark sent. On 429 reschedule, on 4xx other
 //!     than 429 mark failed, on transient error retry up to MAX_ATTEMPTS.
+//!     If the group became a supergroup, move its alerts and retry.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,6 +131,23 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
             );
             if let Err(e) = store
                 .reschedule(alert.id, alert.claim_generation, new_fire)
+                .await
+            {
+                error!(id = alert.id, error = ?e, "reschedule failed");
+            }
+        }
+        Err(teloxide::RequestError::MigrateToChatId(new_chat_id)) => {
+            info!(
+                id = alert.id,
+                from = alert.chat_id,
+                to = new_chat_id.0,
+                "group migrated to a supergroup"
+            );
+            if let Err(e) = store.migrate_chat(alert.chat_id, new_chat_id.0).await {
+                error!(id = alert.id, error = ?e, "chat migration failed");
+            }
+            if let Err(e) = store
+                .reschedule(alert.id, alert.claim_generation, Utc::now())
                 .await
             {
                 error!(id = alert.id, error = ?e, "reschedule failed");
@@ -321,6 +339,46 @@ mod tests {
             AlertState::Sent
         );
         server.abort();
+        store.pool().close().await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn supergroup_migration_moves_the_alert_and_retries(pool: PgPool) {
+        let store = PgStore::connect(pool.connect_options().to_url_lossy().as_str(), 5)
+            .await
+            .unwrap();
+        store.upsert_user(42, Language::En).await.unwrap();
+        let at = Utc::now() - chrono::Duration::seconds(1);
+        let alert = store
+            .create_alert(NewAlert {
+                user_id: 42,
+                chat_id: -100,
+                chat_type: ChatType::Group,
+                scope: AlertScope::Shared,
+                text: "standup".into(),
+                fire_at: at,
+                schedule: Schedule::one_shot(at, chrono_tz::UTC),
+            })
+            .await
+            .unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: group chat was upgraded to a supergroup chat","parameters":{"migrate_to_chat_id":-1001234}}"#
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        process_due(&Bot::new("123:test").set_api_url(url), &store)
+            .await
+            .unwrap();
+        server.abort();
+        let after = store.get_alert(alert.id).await.unwrap().unwrap();
+        assert_eq!(after.chat_id, -1_001_234);
+        assert_eq!(after.chat_type, ChatType::Supergroup);
+        assert_eq!(after.state, AlertState::Pending);
+        assert!(after.fire_at <= Utc::now());
         store.pool().close().await;
     }
 }
