@@ -181,13 +181,28 @@ async fn main() -> Result<()> {
 
 fn ingress_user_id(update: &Update) -> Option<i64> {
     match &update.kind {
-        UpdateKind::Message(message) if message.sender_chat.is_none() => message
-            .from
-            .as_ref()
-            .and_then(|user| identity::user_id(user.id.0)),
-        UpdateKind::CallbackQuery(query) => identity::user_id(query.from.id.0),
+        UpdateKind::Message(message)
+            if message.sender_chat.is_none() && !is_direct_messages_chat_id(message.chat.id.0) =>
+        {
+            message
+                .from
+                .as_ref()
+                .and_then(|user| identity::user_id(user.id.0))
+        }
+        UpdateKind::CallbackQuery(query)
+            if query
+                .message
+                .as_ref()
+                .is_none_or(|message| !is_direct_messages_chat_id(message.chat().id.0)) =>
+        {
+            identity::user_id(query.from.id.0)
+        }
         _ => None,
     }
+}
+
+fn is_direct_messages_chat_id(chat_id: i64) -> bool {
+    (-4_000_000_000_000..=-2_002_147_483_649).contains(&chat_id)
 }
 
 fn dispatch_shard(update: &Update) -> Option<u8> {
@@ -483,8 +498,42 @@ fn spawn_signal_handler(
 #[cfg(test)]
 mod supervision_tests {
     use super::*;
+    use serde_json::json;
     use std::future::pending;
     use std::time::Duration;
+
+    fn message_update(chat_id: i64, chat_type: &str) -> Update {
+        serde_json::from_value(json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": 1,
+                "chat": { "id": chat_id, "type": chat_type },
+                "from": { "id": 7, "is_bot": false, "first_name": "Ada" },
+                "text": "/help"
+            }
+        }))
+        .unwrap()
+    }
+
+    fn callback_update(chat_id: i64) -> Update {
+        serde_json::from_value(json!({
+            "update_id": 2,
+            "callback_query": {
+                "id": "callback-id",
+                "from": { "id": 7, "is_bot": false, "first_name": "Ada" },
+                "chat_instance": "instance-id",
+                "message": {
+                    "message_id": 2,
+                    "date": 1,
+                    "chat": { "id": chat_id, "type": "supergroup" },
+                    "text": "alert"
+                },
+                "data": "cancel:1"
+            }
+        }))
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn worker_failures_interrupt_a_running_dispatcher() {
@@ -592,5 +641,66 @@ mod supervision_tests {
         for update in [&first, &second, &future] {
             assert!(dispatch_shard(update).unwrap() < DISPATCH_SHARDS as u8);
         }
+    }
+
+    #[test]
+    fn direct_messages_chat_id_range_is_rejected_at_both_boundaries() {
+        for chat_id in [-4_000_000_000_000, -2_002_147_483_649] {
+            assert_eq!(
+                ingress_user_id(&message_update(chat_id, "supergroup")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn chat_ids_just_outside_direct_messages_range_are_preserved() {
+        for chat_id in [-4_000_000_000_001, -2_002_147_483_648] {
+            assert_eq!(
+                ingress_user_id(&message_update(chat_id, "supergroup")),
+                Some(7)
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_private_group_and_supergroup_messages_are_preserved() {
+        for (chat_id, chat_type) in [
+            (7, "private"),
+            (-42, "group"),
+            (-1_000_000_000_001, "supergroup"),
+        ] {
+            assert_eq!(
+                ingress_user_id(&message_update(chat_id, chat_type)),
+                Some(7)
+            );
+        }
+    }
+
+    #[test]
+    fn sender_chat_messages_remain_rejected() {
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 3,
+            "message": {
+                "message_id": 3,
+                "date": 1,
+                "chat": { "id": -42, "type": "group" },
+                "from": { "id": 7, "is_bot": false, "first_name": "Ada" },
+                "sender_chat": { "id": -100, "type": "channel" },
+                "text": "/help"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(ingress_user_id(&update), None);
+    }
+
+    #[test]
+    fn callbacks_from_direct_messages_chats_are_rejected() {
+        assert_eq!(ingress_user_id(&callback_update(-2_002_147_483_649)), None);
+        assert_eq!(
+            ingress_user_id(&callback_update(-1_000_000_000_001)),
+            Some(7)
+        );
     }
 }
