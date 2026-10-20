@@ -594,6 +594,24 @@ async fn group_alert_creation_allowed(
     Ok(false)
 }
 
+async fn group_snooze_creation_allowed(
+    bot: &Bot,
+    query: &CallbackQuery,
+    chat_id: ChatId,
+    lang: Language,
+) -> Result<bool, teloxide::RequestError> {
+    let message = match bot_group_authority(bot, chat_id).await {
+        BotGroupAuthority::Privileged => return Ok(true),
+        BotGroupAuthority::NotPrivileged => m::group_alert_bot_admin_required(lang),
+        BotGroupAuthority::Unavailable => m::group_alert_bot_admin_check_failed(lang),
+    };
+    bot.answer_callback_query(query.id.clone())
+        .text(message)
+        .show_alert(true)
+        .await?;
+    Ok(false)
+}
+
 /// Resolve authority for a private cancellation. The exact origin check comes
 /// first so a forged callback can never trigger a Telegram lookup for another
 /// chat. Owners need no network lookup. Only visible users returned by
@@ -836,6 +854,13 @@ async fn handle_snooze_callback(
             .await?;
         return Ok(());
     };
+    let origin_chat_type = chat_type_from_chat(origin_message.chat());
+    if origin_chat_type.is_group()
+        && !group_snooze_creation_allowed(bot, query, origin_message.chat().id, user.language)
+            .await?
+    {
+        return Ok(());
+    }
     let created = match store
         .create_snooze_with_limits(
             alert_id,
@@ -1167,7 +1192,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((path.clone(), String::from_utf8(body.to_vec()).unwrap()));
-                if path.ends_with("/getChatMember") {
+                if path.ends_with("/GetChatMember") {
                     membership_response
                 } else {
                     r#"{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":-100,"type":"group"},"text":"status"}}"#
@@ -1210,7 +1235,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((path.clone(), String::from_utf8(body.to_vec()).unwrap()));
-                if path.ends_with("/getChatMember") {
+                if path.ends_with("/GetChatMember") {
                     membership_response
                 } else {
                     r#"{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":-100,"type":"group"},"text":"status"}}"#
@@ -1224,6 +1249,59 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let allowed = group_alert_creation_allowed(
             &Bot::new("123:test").set_api_url(url),
+            ChatId(-100),
+            lang,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        let captured = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+        (allowed, captured)
+    }
+
+    async fn group_snooze_from_mock(
+        membership_response: &'static str,
+        lang: Language,
+    ) -> (bool, Vec<(String, String)>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let captured = Arc::clone(&captured);
+            async move {
+                let path = request.uri().path().to_string();
+                let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), String::from_utf8(body.to_vec()).unwrap()));
+                if path.ends_with("/GetChatMember") {
+                    membership_response
+                } else {
+                    r#"{"ok":true,"result":true}"#
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let query: CallbackQuery = serde_json::from_str(
+            r#"{
+                "id":"callback-id",
+                "from":{"id":42,"is_bot":false,"first_name":"Ada"},
+                "chat_instance":"instance-id",
+                "message":{"message_id":2,"date":1,"chat":{"id":-100,"type":"group"},"text":"alert"},
+                "data":"snooze:300:1"
+            }"#,
+        )
+        .unwrap();
+        let allowed = group_snooze_creation_allowed(
+            &Bot::new("123:test").set_api_url(url),
+            &query,
             ChatId(-100),
             lang,
         )
@@ -1316,7 +1394,7 @@ mod tests {
         let (allowed, requests) = group_creation_from_mock(administrator, Language::En).await;
         assert!(allowed);
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].0.ends_with("/getChatMember"));
+        assert!(requests[0].0.ends_with("/GetChatMember"));
         assert!(requests[0].1.contains("123"));
     }
 
@@ -1326,7 +1404,7 @@ mod tests {
         let (allowed, requests) = group_creation_from_mock(member, Language::De).await;
         assert!(!allowed);
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].0.ends_with("/sendMessage"));
+        assert!(requests[1].0.ends_with("/SendMessage"));
         assert!(requests[1]
             .1
             .contains(m::group_alert_bot_admin_required(Language::De)));
@@ -1338,7 +1416,7 @@ mod tests {
         let (allowed, requests) = group_creation_from_mock(error, Language::En).await;
         assert!(!allowed);
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].0.ends_with("/sendMessage"));
+        assert!(requests[1].0.ends_with("/SendMessage"));
         assert!(requests[1]
             .1
             .contains(m::group_alert_bot_admin_check_failed(Language::En)));
@@ -1352,12 +1430,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_snooze_rejects_demoted_bot_before_creation() {
+        let member = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"member"}}"#;
+        let (allowed, requests) = group_snooze_from_mock(member, Language::De).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.ends_with("/GetChatMember"));
+        assert!(requests[1].0.ends_with("/AnswerCallbackQuery"));
+        assert!(requests[1]
+            .1
+            .contains(m::group_alert_bot_admin_required(Language::De)));
+    }
+
+    #[tokio::test]
+    async fn group_snooze_fails_closed_when_bot_role_lookup_fails() {
+        let error = r#"{"ok":false,"error_code":400,"description":"Bad Request"}"#;
+        let (allowed, requests) = group_snooze_from_mock(error, Language::En).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("/AnswerCallbackQuery"));
+        assert!(requests[1]
+            .1
+            .contains(m::group_alert_bot_admin_check_failed(Language::En)));
+    }
+
+    #[tokio::test]
     async fn shared_cancel_command_accepts_current_members_immediately_before_mutation() {
         let response = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"member"}}"#;
         let (allowed, requests) = command_membership_from_mock(response, Language::En).await;
         assert!(allowed);
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].0.ends_with("/getChatMember"));
+        assert!(requests[0].0.ends_with("/GetChatMember"));
     }
 
     #[tokio::test]
@@ -1366,7 +1469,7 @@ mod tests {
         let (allowed, requests) = command_membership_from_mock(response, Language::En).await;
         assert!(!allowed);
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].0.ends_with("/sendMessage"));
+        assert!(requests[1].0.ends_with("/SendMessage"));
         assert!(requests[1]
             .1
             .contains(m::shared_membership_required(Language::En)));
@@ -1379,7 +1482,7 @@ mod tests {
         let (allowed, requests) = command_membership_from_mock(response, Language::De).await;
         assert!(!allowed);
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].0.ends_with("/sendMessage"));
+        assert!(requests[1].0.ends_with("/SendMessage"));
         assert!(requests[1]
             .1
             .contains(m::shared_membership_check_failed(Language::De)));
