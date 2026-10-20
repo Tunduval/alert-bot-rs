@@ -15,35 +15,25 @@ use parser::ParseContext;
 use storage::PgStore;
 
 use crate::commands::Command;
-use crate::limits::{self, CommandRateLimiter};
+use crate::identity;
+use crate::limits;
 use crate::messages as m;
 use crate::render;
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-pub async fn dispatch(
-    bot: Bot,
-    msg: Message,
-    cmd: Command,
-    store: Arc<PgStore>,
-    limiter: Arc<CommandRateLimiter>,
-) -> HandlerResult {
-    let user_id = match msg.from.as_ref() {
-        Some(u) => u.id.0 as i64,
-        None => return Ok(()), // anonymous channel posts: ignore
-    };
-    let detected_lang = Language::from_telegram_code(
-        msg.from.as_ref().and_then(|u| u.language_code.as_deref()),
-    );
-
-    // Rate-limit before touching the DB. A spammer who blew past their
-    // per-minute budget shouldn't get free upsert_user calls.
-    if !limiter.check(user_id) {
-        bot.send_message(msg.chat.id, m::rate_limited(detected_lang))
-            .await
-            .ok();
+pub async fn dispatch(bot: Bot, msg: Message, cmd: Command, store: Arc<PgStore>) -> HandlerResult {
+    // Telegram supplies a compatibility-only fake `from` user when a message
+    // is sent on behalf of a chat (including anonymous group administrators).
+    // It is not a person identity and must never own a private alert.
+    let Some(user_id) = trusted_sender_id(
+        msg.from.as_ref().map(|user| user.id.0),
+        msg.sender_chat.is_some(),
+    ) else {
         return Ok(());
-    }
+    };
+    let detected_lang =
+        Language::from_telegram_code(msg.from.as_ref().and_then(|u| u.language_code.as_deref()));
 
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -396,21 +386,11 @@ pub async fn callback_dispatch(
     bot: Bot,
     query: CallbackQuery,
     store: Arc<PgStore>,
-    limiter: Arc<CommandRateLimiter>,
 ) -> HandlerResult {
-    let user_id = query.from.id.0 as i64;
-    let detected_lang = Language::from_telegram_code(query.from.language_code.as_deref());
-
-    // Callbacks count against the same per-user budget as commands —
-    // otherwise a scripted client could spam +5m on every button forever.
-    if !limiter.check(user_id) {
-        bot.answer_callback_query(query.id.clone())
-            .text(m::rate_limited(detected_lang))
-            .show_alert(false)
-            .await
-            .ok();
+    let Some(user_id) = identity::user_id(query.from.id.0) else {
         return Ok(());
-    }
+    };
+    let detected_lang = Language::from_telegram_code(query.from.language_code.as_deref());
 
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -673,7 +653,9 @@ pub async fn handle_unhandled(bot: Bot, msg: Message, store: Arc<PgStore>) -> Ha
     let Some(from) = msg.from.as_ref() else {
         return Ok(());
     };
-    let user_id = from.id.0 as i64;
+    let Some(user_id) = identity::user_id(from.id.0) else {
+        return Ok(());
+    };
     let detected_lang = Language::from_telegram_code(from.language_code.as_deref());
     let user = store.upsert_user(user_id, detected_lang).await?;
 
@@ -702,6 +684,14 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn trusted_sender_id(from_id: Option<u64>, has_sender_chat: bool) -> Option<i64> {
+    if has_sender_chat {
+        None
+    } else {
+        from_id.and_then(identity::user_id)
+    }
 }
 
 #[cfg(test)]
@@ -745,5 +735,13 @@ mod tests {
         let row = &kb.inline_keyboard[0];
         assert_eq!(row.len(), 4);
         assert_eq!(callback_data(&row[3]), "stop_series:7");
+    }
+
+    #[test]
+    fn chat_backed_messages_never_become_private_alert_owners() {
+        assert_eq!(trusted_sender_id(Some(42), false), Some(42));
+        assert_eq!(trusted_sender_id(None, false), None);
+        assert_eq!(trusted_sender_id(Some(1_087_968_824), true), None);
+        assert_eq!(trusted_sender_id(Some(i64::MAX as u64 + 1), false), None);
     }
 }

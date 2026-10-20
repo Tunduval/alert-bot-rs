@@ -62,13 +62,11 @@ anyhow = "1.0.104"
 
 # Serde (used by core for enum derives + chrono/chrono-tz feature flags)
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 # Misc
 dotenvy = "0.15.7"
 url = "2.5.8"
-
-# Rate limiting (in-memory token bucket per Telegram user_id).
-governor = "0.10.4"
 
 # Benchmarking (dev-only)
 criterion = "0.8.2"
