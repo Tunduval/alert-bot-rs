@@ -588,9 +588,11 @@ SQL
 sudo -u alertbot-backup psql -v ON_ERROR_STOP=1 --dbname alertbot \
   --command 'SELECT count(*) FROM alerts;'
 # The backup identity must not reach another database or write persistent
-# large objects. Both checks must fail.
+# large objects, temporary tables, or advisory locks. Every check must fail.
 ! sudo -u alertbot-backup psql --dbname postgres --command 'SELECT 1;'
 ! sudo -u alertbot-backup psql --dbname alertbot --command 'SELECT lo_create(0);'
+! sudo -u alertbot-backup psql --dbname alertbot \
+  --command 'CREATE TEMPORARY TABLE privilege_probe(value integer);'
 ! sudo -u alertbot-backup psql --dbname alertbot \
   --command 'SELECT pg_try_advisory_lock(1);'
 
@@ -668,7 +670,8 @@ The unit runs as `alertbot-backup`. PostgreSQL peer authentication maps that
 Unix account to the matching database role. That role has only `CONNECT`,
 schema `USAGE`, and `SELECT` grants; it cannot assume the application owner.
 It has one connection slot, cannot enter another database, cannot acquire the
-application's advisory locks, and cannot create PostgreSQL large objects.
+application's advisory locks, and cannot create temporary tables or PostgreSQL
+large objects.
 The dump excludes large objects because this application does not use them.
 The `postgres` superuser is not required while a backup runs. Provisioning the
 role and its access controls still requires an administrator. The bot's Unix
