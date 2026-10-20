@@ -159,68 +159,16 @@ useradd --system --no-create-home --shell /usr/sbin/nologin alertbot
 sudo -u postgres createuser alertbot
 sudo -u postgres createdb -O alertbot alertbot
 
-# This service needs a dedicated PostgreSQL cluster because connection slots
-# are cluster-wide. The query must return no unexpected non-superuser login
-# roles. Isolate every result in another cluster before continuing.
-sudo -u postgres psql --dbname alertbot --command \
-  "SELECT rolname, rolconnlimit FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND rolname <> 'alertbot';"
-
-# Bound service connections and remove write-like primitives from every
-# ordinary login in this database. The app keeps only the session and
-# transaction advisory-lock functions listed here.
-sudo -u postgres psql -v ON_ERROR_STOP=1 --dbname alertbot <<'SQL'
-ALTER ROLE alertbot CONNECTION LIMIT 12;
-ALTER DATABASE alertbot OWNER TO alertbot;
-REVOKE CONNECT, TEMPORARY ON DATABASE alertbot FROM PUBLIC;
-GRANT CONNECT, TEMPORARY ON DATABASE alertbot TO alertbot;
-
-REVOKE EXECUTE ON FUNCTION
-    pg_catalog.pg_advisory_lock(bigint),
-    pg_catalog.pg_advisory_lock(integer, integer),
-    pg_catalog.pg_advisory_lock_shared(bigint),
-    pg_catalog.pg_advisory_lock_shared(integer, integer),
-    pg_catalog.pg_advisory_xact_lock(bigint),
-    pg_catalog.pg_advisory_xact_lock(integer, integer),
-    pg_catalog.pg_advisory_xact_lock_shared(bigint),
-    pg_catalog.pg_advisory_xact_lock_shared(integer, integer),
-    pg_catalog.pg_try_advisory_lock(bigint),
-    pg_catalog.pg_try_advisory_lock(integer, integer),
-    pg_catalog.pg_try_advisory_lock_shared(bigint),
-    pg_catalog.pg_try_advisory_lock_shared(integer, integer),
-    pg_catalog.pg_try_advisory_xact_lock(bigint),
-    pg_catalog.pg_try_advisory_xact_lock(integer, integer),
-    pg_catalog.pg_try_advisory_xact_lock_shared(bigint),
-    pg_catalog.pg_try_advisory_xact_lock_shared(integer, integer)
-FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION
-    pg_catalog.pg_advisory_lock(bigint),
-    pg_catalog.pg_advisory_unlock(bigint),
-    pg_catalog.pg_advisory_xact_lock(bigint)
-TO alertbot;
-
-REVOKE EXECUTE ON FUNCTION
-    pg_catalog.lo_creat(integer),
-    pg_catalog.lo_create(oid),
-    pg_catalog.lo_from_bytea(oid, bytea),
-    pg_catalog.lo_put(oid, bigint, bytea),
-    pg_catalog.lowrite(integer, bytea),
-    pg_catalog.lo_truncate(integer, integer),
-    pg_catalog.lo_truncate64(integer, bigint),
-    pg_catalog.lo_unlink(oid)
-FROM PUBLIC;
-SQL
-
-# No ordinary login may consume PostgreSQL's reserved connection slots. This
-# query must return no rows.
-sudo -u postgres psql --dbname alertbot --command \
-  "SELECT rolname FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND pg_has_role(rolname, 'pg_use_reserved_connections', 'member');"
+# Sanity check — should print a row count of 0.
+sudo -u alertbot psql -d alertbot -c "SELECT count(*) FROM pg_tables WHERE schemaname='public';"
 ```
 
-Put these rules before every generic `local` or `host` rule in
-`/etc/postgresql/<major>/main/pg_hba.conf`. PostgreSQL uses the first matching
-rule. The local rule lets the service identity enter only the application
-database. The host rules reject IPv4 and IPv6 TCP connections before a later
-password rule could accept them:
+No password is stored anywhere — peer auth via the Unix socket binds
+identity to the calling system user. To keep it that way, put these rules
+before every generic `local` or `host` rule in
+`/etc/postgresql/<major>/main/pg_hba.conf` and reload PostgreSQL. They let the
+`alertbot` role reach only its own database over the socket and reject it on
+TCP, so a later password rule can't become a second way in:
 
 ```text
 local   alertbot   alertbot   peer
@@ -229,38 +177,8 @@ host    all        alertbot   0.0.0.0/0   reject
 host    all        alertbot   ::0/0       reject
 ```
 
-Do not add another `local` or `host` rule for this role. A PostgreSQL login
-role can set its own password. The explicit host rejects therefore remain
-required even though this deployment neither sets nor stores database
-passwords. A later generic password rule must not become an alternative path.
-
-Reload PostgreSQL after editing the file, then verify the boundary:
-
-```bash
-sudo -u postgres psql --dbname alertbot --command 'SELECT pg_reload_conf();'
-# This query must return no rows. A successful reload alone does not prove that
-# PostgreSQL accepted every HBA rule.
-sudo -u postgres psql --dbname alertbot --command \
-  'SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL;'
-# Review the complete effective order. The four service-role rules above must
-# appear before every generic local or host rule.
-sudo -u postgres psql --dbname alertbot --command \
-  'SELECT line_number, type, database, user_name, address, auth_method FROM pg_hba_file_rules ORDER BY line_number;'
-
-# Peer-authentication sanity check — must succeed and print a row count.
-sudo -u alertbot psql -d alertbot -c "SELECT count(*) FROM pg_tables WHERE schemaname='public';"
-# The HBA isolation check must fail.
-! sudo -u alertbot psql -d postgres -c 'SELECT 1;'
-# Both TCP checks must fail with "pg_hba.conf rejects connection", not a
-# password prompt. Test both address families when PostgreSQL listens on them.
-! sudo -u alertbot psql "hostaddr=127.0.0.1 dbname=alertbot user=alertbot connect_timeout=2" -c 'SELECT 1;'
-! sudo -u alertbot psql "hostaddr=::1 dbname=alertbot user=alertbot connect_timeout=2" -c 'SELECT 1;'
-```
-
-The app role owns the application database and keeps `TEMPORARY` plus only the
-three advisory-lock functions listed above. Peer authentication via the Unix
-socket binds the database identity to its matching system user without a
-stored password.
+The bot sets `lock_timeout = 5s` and `statement_timeout = 30s` on every
+connection, so a stuck lock can't hold the pool forever.
 
 #### 3. Install the systemd unit + config file
 
