@@ -285,7 +285,7 @@ impl PgStore {
     }
 
     /// Re-queue: bumps `state` back to `pending` with a new `fire_at`.
-    /// Used by retry logic when Telegram returns 429 (rate-limited).
+    /// Used by retry logic after a failed send.
     /// Deliberately keeps `attempts` — it's the same occurrence being retried.
     pub async fn reschedule(
         &self,
@@ -293,13 +293,37 @@ impl PgStore {
         generation: i64,
         fire_at: DateTime<Utc>,
     ) -> Result<bool> {
+        self.requeue(id, generation, fire_at, 0).await
+    }
+
+    /// Re-queue after Telegram returned 429. The send was refused before any
+    /// delivery was tried, so the claim's attempt is handed back and rate
+    /// limits cannot use up the retry budget for real failures.
+    pub async fn reschedule_after_rate_limit(
+        &self,
+        id: i64,
+        generation: i64,
+        fire_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.requeue(id, generation, fire_at, 1).await
+    }
+
+    async fn requeue(
+        &self,
+        id: i64,
+        generation: i64,
+        fire_at: DateTime<Utc>,
+        refunded_attempts: i16,
+    ) -> Result<bool> {
         let res = sqlx::query(
-            "UPDATE alerts SET state = 'pending', fire_at = $3, claimed_at = NULL, updated_at = now()
+            "UPDATE alerts SET state = 'pending', fire_at = $3, claimed_at = NULL, updated_at = now(),
+                 attempts = GREATEST(attempts - $4, 0)
              WHERE id = $1 AND state = 'claimed' AND claim_generation = $2",
         )
         .bind(id)
         .bind(generation)
         .bind(fire_at)
+        .bind(refunded_attempts)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() == 1)

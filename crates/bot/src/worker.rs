@@ -133,7 +133,7 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
                 "telegram 429, rescheduling"
             );
             if let Err(e) = store
-                .reschedule(alert.id, alert.claim_generation, new_fire)
+                .reschedule_after_rate_limit(alert.id, alert.claim_generation, new_fire)
                 .await
             {
                 error!(id = alert.id, error = ?e, "reschedule failed");
@@ -156,9 +156,15 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
                 error!(id = alert.id, error = ?e, "reschedule failed");
             }
         }
-        Err(teloxide::RequestError::Api(ApiError::BotBlocked))
-        | Err(teloxide::RequestError::Api(ApiError::ChatNotFound))
-        | Err(teloxide::RequestError::Api(ApiError::UserDeactivated)) => {
+        Err(teloxide::RequestError::Api(
+            ApiError::BotBlocked
+            | ApiError::ChatNotFound
+            | ApiError::UserDeactivated
+            | ApiError::BotKicked
+            | ApiError::BotKickedFromSupergroup
+            | ApiError::BotKickedFromChannel
+            | ApiError::GroupDeactivated,
+        )) => {
             // Permanent: nobody to deliver to.
             warn!(id = alert.id, "permanent delivery failure");
             if let Err(e) = store
@@ -442,6 +448,84 @@ mod tests {
             deliver_after_last_transient_failure(pool, |at| Schedule::one_shot(at, chrono_tz::UTC))
                 .await;
         assert_eq!(after.state, AlertState::Failed);
+    }
+
+    async fn deliver_with_responses(pool: PgPool, responses: &'static [&'static str]) -> Alert {
+        let store = PgStore::connect(pool.connect_options().to_url_lossy().as_str(), 5)
+            .await
+            .unwrap();
+        store.upsert_user(42, Language::En).await.unwrap();
+        let at = Utc::now() - chrono::Duration::seconds(1);
+        let alert = store
+            .create_alert(NewAlert {
+                user_id: 42,
+                chat_id: -1001,
+                chat_type: ChatType::Supergroup,
+                scope: AlertScope::Shared,
+                text: "standup".into(),
+                fire_at: at,
+                schedule: Schedule::daily_at(at, chrono_tz::UTC, 1, at.time()).unwrap(),
+            })
+            .await
+            .unwrap();
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().fallback(move || {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { responses[i.min(responses.len() - 1)] }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let bot = Bot::new("123:test").set_api_url(url);
+        for _ in responses {
+            sqlx::query("UPDATE alerts SET fire_at = now() WHERE id = $1 AND state = 'pending'")
+                .bind(alert.id)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            process_due(&bot, &store).await.unwrap();
+        }
+        server.abort();
+        let after = store.get_alert(alert.id).await.unwrap().unwrap();
+        store.pool().close().await;
+        after
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn removal_from_a_group_ends_the_series(pool: PgPool) {
+        let after = deliver_with_responses(
+            pool,
+            &[r#"{"ok":false,"error_code":403,"description":"Forbidden: bot was kicked from the supergroup chat"}"#],
+        )
+        .await;
+        assert_eq!(after.state, AlertState::Failed);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn rate_limits_do_not_use_up_the_retry_budget(pool: PgPool) {
+        const RATE_LIMITED: &str = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 0","parameters":{"retry_after":0}}"#;
+        const FAILED: &str =
+            r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#;
+        let after = deliver_with_responses(
+            pool,
+            &[
+                RATE_LIMITED,
+                RATE_LIMITED,
+                RATE_LIMITED,
+                RATE_LIMITED,
+                RATE_LIMITED,
+                FAILED,
+            ],
+        )
+        .await;
+        // The failed send is retried within the current occurrence.
+        assert_eq!(after.state, AlertState::Pending);
+        assert_eq!(after.attempts, 1);
+        assert!(after.fire_at < Utc::now() + chrono::Duration::minutes(1));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
