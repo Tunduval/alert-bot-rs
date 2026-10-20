@@ -45,7 +45,12 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
   a hint to use bare clock-time instead.
 - **Group reminders with two scopes**
   - `/alert` in a group fires in the group, but only the creator can cancel it.
-  - `/galert` is a shared group reminder; anyone in the chat can cancel.
+  - `/galert` is a shared group reminder; any current member can cancel it,
+    snooze it, or stop its series. The bot must be a group administrator so it
+    can check membership with Telegram. Failed checks leave the reminder
+    unchanged. When upgrading, make the bot an administrator in every group
+    that already has `/galert` reminders; otherwise members may be unable to
+    cancel, snooze, or stop them.
 - **Delivery controls** — snooze by 5 minutes, 15 minutes or 1 hour; stop a
   recurring series directly from its delivered message.
 - **Per-user language and timezone** — auto-detected from Telegram's

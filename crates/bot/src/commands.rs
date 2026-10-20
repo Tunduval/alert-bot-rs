@@ -19,7 +19,7 @@ pub enum Command {
     #[command(description = "neuer Reminder, privat — nur du kannst ihn editieren")]
     Alert(String),
 
-    #[command(description = "Gruppen-Reminder — jeder im Chat kann ihn editieren")]
+    #[command(description = "Gruppen-Reminder — jedes aktuelle Mitglied kann ihn editieren")]
     Galert(String),
 
     #[command(description = "listet aktive Reminder im aktuellen Chat")]
