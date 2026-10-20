@@ -421,8 +421,8 @@ pub fn list_empty(lang: Language) -> &'static str {
 
 pub fn list_header(lang: Language) -> &'static str {
     match lang {
-        Language::De => "<b>Aktive Reminder</b>",
-        Language::En => "<b>Active reminders</b>",
+        Language::De => "Aktive Reminder",
+        Language::En => "Active reminders",
     }
 }
 

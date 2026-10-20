@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -62,6 +62,7 @@ anyhow = "1.0.104"
 
 # Serde (used by core for enum derives + chrono/chrono-tz feature flags)
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 # Misc
 dotenvy = "0.15.7"

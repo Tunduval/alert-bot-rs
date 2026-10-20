@@ -1,7 +1,7 @@
 # alert-bot-rs
 
 [![CI](https://github.com/duramson/alert-bot-rs/actions/workflows/deploy.yml/badge.svg)](https://github.com/duramson/alert-bot-rs/actions/workflows/deploy.yml)
-[![Rust](https://img.shields.io/badge/rust-1.86%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.96%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Try it on Telegram](https://img.shields.io/badge/Telegram-%40rust__alertbot-26A5E4?logo=telegram&logoColor=white)](https://t.me/rust_alertbot)
 
@@ -132,6 +132,11 @@ bash -c "$(wget -qLO - https://community-scripts.org/scripts/postgresql)"
 Pick the non-Alpine variant. The size difference is irrelevant on a
 dedicated DB LXC and Debian's glibc matches what GitHub Actions produces
 for the bot binary. Defaults are fine (2 CPU / 2 GB / 8 GB disk).
+
+Use PostgreSQL 16.15, 17.11, 18.6, or a later minor release of those major
+versions. Older releases lack the security fixes of 2026-08-13. Update the
+LXC's packages if the installed minor version is older. The same floors apply
+to the client package that provides `pg_dump`.
 
 Note the LXC's IP — the script prints it at the end.
 
@@ -469,7 +474,7 @@ crates/
 
 ## Development
 
-Requires Rust ≥ 1.86.
+Requires Rust ≥ 1.96.
 
 ```bash
 cargo test --workspace --locked
