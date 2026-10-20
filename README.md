@@ -298,6 +298,7 @@ scp alertbot-migration.dump root@<new-lxc-ip>:/root/alertbot-migration.dump
 On the new LXC:
 
 ```bash
+( # The subshell keeps set -e from closing your login shell afterwards.
 set -euo pipefail
 migration=/root/alertbot-migration.dump
 test -f "$migration"
@@ -318,6 +319,7 @@ sudo -u alertbot psql -d alertbot \
     -c "SELECT count(*), max(created_at) FROM alerts;"
 cleanup_migration
 trap - EXIT
+)
 ```
 
 Continue with step 4. The first start applies the missing migrations to the
@@ -446,6 +448,12 @@ EOF
 umask 077
 install -o root -g root -m 0700 -d /etc/alertbot-backup
 install -o root -g root -m 0755 -d /etc/alertbot-restore
+# A replacement LXC after a restore already holds the previous public key. It
+# still authenticates every older backup, so keep it under a dated name.
+if [[ -e /etc/alertbot-restore/signing-public.pem ]]; then
+  mv /etc/alertbot-restore/signing-public.pem \
+    "/etc/alertbot-restore/signing-public-until-$(date -u +%Y%m%dT%H%M%SZ).pem"
+fi
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
   -out /etc/alertbot-backup/signing-private.pem
 openssl pkey -in /etc/alertbot-backup/signing-private.pem -pubout \
@@ -461,6 +469,12 @@ systemctl start alertbot-backup.service        # test now
 journalctl -u alertbot-backup -n 30
 ! systemctl is-failed --quiet alertbot-backup.service
 ```
+
+Copy `/etc/alertbot-restore/signing-public.pem` and
+`/etc/alertbot-backup-known-hosts` to an independently trusted place off the
+LXC, for example next to the offline `age` identity. A restore after losing the
+LXC needs both, and neither may come from the SFTP archive. Keep every earlier
+public key as well: a backup verifies only with the key that signed it.
 
 `BACKUP_NETCUP_PATH` names an absolute directory inside the SFTP server's
 visible filesystem, with the leading slash omitted in the configuration.
@@ -489,8 +503,9 @@ official fix for
 which otherwise lets a crafted database object execute code in `pg_dump`.
 
 The unit runs as `alertbot-backup`. PostgreSQL peer authentication maps that
-Unix account to the matching database role. That role has only `CONNECT`,
-schema `USAGE`, and `SELECT` grants; it cannot assume the application owner.
+Unix account to the matching database role. Beyond PostgreSQL's defaults for
+`PUBLIC`, that role gets only `CONNECT`, schema `USAGE`, and `SELECT` grants;
+it cannot assume the application owner.
 It has one connection slot and cannot enter another database.
 The dump excludes large objects because this application does not use them.
 The `postgres` superuser is not required while a backup runs. Provisioning the
@@ -506,14 +521,23 @@ Do not run step 8 yet. Keep the current database untouched for rollback.
 Use the same database name so the documented peer-authentication rules still
 apply. The empty-target check below rejects an already migrated database.
 
-Obtain the existing restore public key and SFTP host key from their
-independently trusted backup. Install that public key as root-owned
+Install the restore tools and the trust directory, which step 8 would
+otherwise create:
+
+```bash
+apt install -y age curl openssl
+install -o root -g root -m 0755 -d /etc/alertbot-restore
+```
+
+Obtain the restore public key that signed the chosen backup and the SFTP host
+key from their independently trusted backup. Install that public key as root-owned
 `/etc/alertbot-restore/signing-public.pem` and the verified host key as
 root-owned `/etc/alertbot-backup-known-hosts`. Do not create a new signing key
 for verification: it cannot authenticate existing backups. Do not obtain the
 public key from the SFTP archive directory.
 
 ```bash
+( # The subshell keeps set -e from closing your login shell afterwards.
 set -euo pipefail
 restore_dir=$(mktemp -d /root/alertbot-restore.XXXXXX)
 identity_mount=/media/alertbot-age
@@ -609,6 +633,7 @@ sudo -u alertbot psql -X -v ON_ERROR_STOP=1 -d alertbot \
   -c "SELECT count(*), max(created_at) FROM alerts;"
 cleanup_restore
 trap - EXIT
+)
 ```
 
 Never restore a dump without its signed manifest. Never use a public key
