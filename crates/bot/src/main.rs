@@ -27,7 +27,7 @@ mod worker;
 
 use admin::AdminNotifier;
 use commands::Command;
-use limits::CommandRateLimiter;
+use limits::{CommandRateLimiter, RateLimit};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DISPATCH_SHARDS: i64 = 16;
@@ -93,13 +93,21 @@ async fn main() -> Result<()> {
             let Some(user_id) = ingress_user_id(&update) else {
                 return false;
             };
-            if is_rate_limited(&update, &me) && !limiter.check(user_id) {
-                // Rate-limited commands stay silent, but an unanswered
-                // callback leaves the button's loading indicator spinning.
-                if let UpdateKind::CallbackQuery(query) = &update.kind {
-                    handlers::answer_rate_limited_callback(&bot, query).await;
+            if is_rate_limited(&update, &me) {
+                match limiter.check(user_id) {
+                    RateLimit::Allowed => {}
+                    // Rate-limited commands stay silent, but an unanswered
+                    // callback leaves the button's loading indicator spinning.
+                    RateLimit::UserBudgetExhausted => {
+                        if let UpdateKind::CallbackQuery(query) = &update.kind {
+                            handlers::answer_rate_limited_callback(&bot, query).await;
+                        }
+                        return false;
+                    }
+                    // Forged updates with fresh IDs reach the shared ceilings
+                    // in bulk; answering them would cost one outbound call each.
+                    RateLimit::SharedCeiling => return false,
                 }
-                return false;
             }
 
             // Telegram retries webhook deliveries on timeout. Drop duplicates
