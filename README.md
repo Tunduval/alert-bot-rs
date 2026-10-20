@@ -1,7 +1,7 @@
 # alert-bot-rs
 
 [![CI](https://github.com/duramson/alert-bot-rs/actions/workflows/deploy.yml/badge.svg)](https://github.com/duramson/alert-bot-rs/actions/workflows/deploy.yml)
-[![Rust](https://img.shields.io/badge/rust-1.86%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.96%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Try it on Telegram](https://img.shields.io/badge/Telegram-%40rust__alertbot-26A5E4?logo=telegram&logoColor=white)](https://t.me/rust_alertbot)
 
@@ -45,7 +45,12 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
   a hint to use bare clock-time instead.
 - **Group reminders with two scopes**
   - `/alert` in a group fires in the group, but only the creator can cancel it.
-  - `/galert` is a shared group reminder; anyone in the chat can cancel.
+  - `/galert` is a shared group reminder; any current member can cancel it,
+    snooze it, or stop its series. The bot must be a group administrator so it
+    can check membership with Telegram. Failed checks leave the reminder
+    unchanged. When upgrading, make the bot an administrator in every group
+    that already has `/galert` reminders; otherwise members may be unable to
+    cancel, snooze, or stop them.
 - **Delivery controls** — snooze by 5 minutes, 15 minutes or 1 hour; stop a
   recurring series directly from its delivered message.
 - **Per-user language and timezone** — auto-detected from Telegram's
@@ -133,6 +138,11 @@ Pick the non-Alpine variant. The size difference is irrelevant on a
 dedicated DB LXC and Debian's glibc matches what GitHub Actions produces
 for the bot binary. Defaults are fine (2 CPU / 2 GB / 8 GB disk).
 
+Use PostgreSQL 16.15, 17.11, 18.6, or a later minor release of those major
+versions. Older releases lack the security fixes of 2026-08-13. Update the
+LXC's packages if the installed minor version is older. The same floors apply
+to the client package that provides `pg_dump`.
+
 Note the LXC's IP — the script prints it at the end.
 
 #### 2. Postgres role + database + system user
@@ -149,68 +159,17 @@ useradd --system --no-create-home --shell /usr/sbin/nologin alertbot
 sudo -u postgres createuser alertbot
 sudo -u postgres createdb -O alertbot alertbot
 
-# This service needs a dedicated PostgreSQL cluster because connection slots
-# are cluster-wide. The query must return no unexpected non-superuser login
-# roles. Isolate every result in another cluster before continuing.
-sudo -u postgres psql --dbname alertbot --command \
-  "SELECT rolname, rolconnlimit FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND rolname NOT IN ('alertbot', 'alertbot-backup');"
-
-# Bound service connections and remove write-like primitives from every
-# ordinary login in this database. The app keeps only the session and
-# transaction advisory-lock functions listed here.
-sudo -u postgres psql -v ON_ERROR_STOP=1 --dbname alertbot <<'SQL'
-ALTER ROLE alertbot CONNECTION LIMIT 12;
-ALTER DATABASE alertbot OWNER TO alertbot;
-REVOKE CONNECT, TEMPORARY ON DATABASE alertbot FROM PUBLIC;
-GRANT CONNECT, TEMPORARY ON DATABASE alertbot TO alertbot;
-
-REVOKE EXECUTE ON FUNCTION
-    pg_catalog.pg_advisory_lock(bigint),
-    pg_catalog.pg_advisory_lock(integer, integer),
-    pg_catalog.pg_advisory_lock_shared(bigint),
-    pg_catalog.pg_advisory_lock_shared(integer, integer),
-    pg_catalog.pg_advisory_xact_lock(bigint),
-    pg_catalog.pg_advisory_xact_lock(integer, integer),
-    pg_catalog.pg_advisory_xact_lock_shared(bigint),
-    pg_catalog.pg_advisory_xact_lock_shared(integer, integer),
-    pg_catalog.pg_try_advisory_lock(bigint),
-    pg_catalog.pg_try_advisory_lock(integer, integer),
-    pg_catalog.pg_try_advisory_lock_shared(bigint),
-    pg_catalog.pg_try_advisory_lock_shared(integer, integer),
-    pg_catalog.pg_try_advisory_xact_lock(bigint),
-    pg_catalog.pg_try_advisory_xact_lock(integer, integer),
-    pg_catalog.pg_try_advisory_xact_lock_shared(bigint),
-    pg_catalog.pg_try_advisory_xact_lock_shared(integer, integer)
-FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION
-    pg_catalog.pg_advisory_lock(bigint),
-    pg_catalog.pg_advisory_unlock(bigint),
-    pg_catalog.pg_advisory_xact_lock(bigint)
-TO alertbot;
-
-REVOKE EXECUTE ON FUNCTION
-    pg_catalog.lo_creat(integer),
-    pg_catalog.lo_create(oid),
-    pg_catalog.lo_from_bytea(oid, bytea),
-    pg_catalog.lo_put(oid, bigint, bytea),
-    pg_catalog.lowrite(integer, bytea),
-    pg_catalog.lo_truncate(integer, integer),
-    pg_catalog.lo_truncate64(integer, bigint),
-    pg_catalog.lo_unlink(oid)
-FROM PUBLIC;
-SQL
-
-# No ordinary login may consume PostgreSQL's reserved connection slots. This
-# query must return no rows.
-sudo -u postgres psql --dbname alertbot --command \
-  "SELECT rolname FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND pg_has_role(rolname, 'pg_use_reserved_connections', 'member');"
+# Sanity check — should print a row count of 0.
+sudo -u alertbot psql -d alertbot -c "SELECT count(*) FROM pg_tables WHERE schemaname='public';"
 ```
 
-Put these rules before every generic `local` or `host` rule in
-`/etc/postgresql/<major>/main/pg_hba.conf`. PostgreSQL uses the first matching
-rule. The local rules let both service identities enter only the application
-database. The host rules reject IPv4 and IPv6 TCP connections before a later
-password rule could accept them:
+No password is stored anywhere — peer auth via the Unix socket binds
+identity to the calling system user. To keep it that way, put these rules
+before every generic `local` or `host` rule in
+`/etc/postgresql/<major>/main/pg_hba.conf` and reload PostgreSQL. They let the
+`alertbot` and `alertbot-backup` roles reach only their own database over the
+socket and reject them on TCP, so a later password rule can't become a second
+way in:
 
 ```text
 local   alertbot   alertbot,alertbot-backup   peer
@@ -219,38 +178,9 @@ host    all        alertbot,alertbot-backup   0.0.0.0/0   reject
 host    all        alertbot,alertbot-backup   ::0/0       reject
 ```
 
-Do not add another `local` or `host` rule for these roles. A PostgreSQL login
-role can set its own password. The explicit host rejects therefore remain
-required even though this deployment neither sets nor stores database
-passwords. A later generic password rule must not become an alternative path.
-
-Reload PostgreSQL after editing the file, then verify the boundary:
-
-```bash
-sudo -u postgres psql --dbname alertbot --command 'SELECT pg_reload_conf();'
-# This query must return no rows. A successful reload alone does not prove that
-# PostgreSQL accepted every HBA rule.
-sudo -u postgres psql --dbname alertbot --command \
-  'SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL;'
-# Review the complete effective order. The four service-role rules above must
-# appear before every generic local or host rule.
-sudo -u postgres psql --dbname alertbot --command \
-  'SELECT line_number, type, database, user_name, address, auth_method FROM pg_hba_file_rules ORDER BY line_number;'
-
-# Peer-authentication sanity check — must succeed and print a row count.
-sudo -u alertbot psql -d alertbot -c "SELECT count(*) FROM pg_tables WHERE schemaname='public';"
-# The HBA isolation check must fail.
-! sudo -u alertbot psql -d postgres -c 'SELECT 1;'
-# Both TCP checks must fail with "pg_hba.conf rejects connection", not a
-# password prompt. Test both address families when PostgreSQL listens on them.
-! sudo -u alertbot psql "hostaddr=127.0.0.1 dbname=alertbot user=alertbot connect_timeout=2" -c 'SELECT 1;'
-! sudo -u alertbot psql "hostaddr=::1 dbname=alertbot user=alertbot connect_timeout=2" -c 'SELECT 1;'
-```
-
-The app role owns the application database and keeps `TEMPORARY` plus only the
-three advisory-lock functions listed above. The backup role receives only the
-separate read grants in step 8. Peer authentication via the Unix socket binds
-each database identity to its matching system user without a stored password.
+The bot sets `lock_timeout = 5s` and `statement_timeout = 30s` on every
+connection, so a stuck lock can't hold the pool forever. The backup role
+receives only the separate read grants in step 8.
 
 #### 3. Install the systemd unit + config file
 
@@ -475,8 +405,8 @@ SQL
 # Confirm peer authentication and the narrowly scoped read access.
 sudo -u alertbot-backup psql -v ON_ERROR_STOP=1 --dbname alertbot \
   --command 'SELECT count(*) FROM alerts;'
-# The backup identity must not reach another database or write persistent
-# large objects, temporary tables, or advisory locks. Every check must fail.
+# The backup identity must not reach another database or connect over TCP.
+# Every check must fail.
 ! sudo -u alertbot-backup psql --dbname postgres --command 'SELECT 1;'
 ! sudo -u alertbot-backup psql \
   "hostaddr=127.0.0.1 dbname=alertbot user=alertbot-backup connect_timeout=2" \
@@ -484,11 +414,6 @@ sudo -u alertbot-backup psql -v ON_ERROR_STOP=1 --dbname alertbot \
 ! sudo -u alertbot-backup psql \
   "hostaddr=::1 dbname=alertbot user=alertbot-backup connect_timeout=2" \
   --command 'SELECT 1;'
-! sudo -u alertbot-backup psql --dbname alertbot --command 'SELECT lo_create(0);'
-! sudo -u alertbot-backup psql --dbname alertbot \
-  --command 'CREATE TEMPORARY TABLE privilege_probe(value integer);'
-! sudo -u alertbot-backup psql --dbname alertbot \
-  --command 'SELECT pg_try_advisory_lock(1);'
 
 # Existing installations should return no rows here. Review unexpected objects
 # before removing them with lo_unlink; --no-blobs keeps them out of backups but
@@ -566,9 +491,7 @@ which otherwise lets a crafted database object execute code in `pg_dump`.
 The unit runs as `alertbot-backup`. PostgreSQL peer authentication maps that
 Unix account to the matching database role. That role has only `CONNECT`,
 schema `USAGE`, and `SELECT` grants; it cannot assume the application owner.
-It has one connection slot, cannot enter another database, cannot acquire the
-application's advisory locks, and cannot create temporary tables or PostgreSQL
-large objects.
+It has one connection slot and cannot enter another database.
 The dump excludes large objects because this application does not use them.
 The `postgres` superuser is not required while a backup runs. Provisioning the
 role and its access controls still requires an administrator. The bot's Unix
@@ -831,7 +754,7 @@ crates/
 
 ## Development
 
-Requires Rust ≥ 1.86.
+Requires Rust ≥ 1.96.
 
 ```bash
 cargo test --workspace --locked

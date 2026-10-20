@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-22.04
     services:
       postgres:
-        image: postgres:16-alpine   # match production (native Postgres 16 on the LXC)
+        image: postgres:16.15-alpine   # match production (native Postgres 16 on the LXC)
         env:
           POSTGRES_PASSWORD: test-only
         ports:

@@ -6,8 +6,8 @@ use chrono::Utc;
 use chrono_tz::Tz;
 use teloxide::prelude::*;
 use teloxide::types::{
-    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode,
-    PublicChatKind, Recipient,
+    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode,
+    PublicChatKind, Recipient, UserId,
 };
 
 use botcore::{AlertScope, ChatType, Language, NewAlert, Schedule};
@@ -151,6 +151,11 @@ async fn create_alert(
     }
 
     let chat_type = chat_type_from_msg(msg);
+    if scope == AlertScope::Shared
+        && !group_alert_creation_allowed(bot, msg.chat.id, user.language).await?
+    {
+        return Ok(());
+    }
     let new = NewAlert {
         user_id: user.telegram_id,
         chat_id: msg.chat.id.0,
@@ -194,10 +199,22 @@ async fn create_alert(
         reply.push_str(&html_escape(&m::parse_note(*note, user.language)));
     }
 
-    bot.send_message(msg.chat.id, reply)
-        .reply_markup(action_keyboard(user.language, alert.id))
-        .await?;
+    confirmation_request(bot, msg.chat.id, reply, user.language, alert.id).await?;
     Ok(())
+}
+
+/// `reply` is HTML: the caller escapes user-controlled parts (creator handle,
+/// notes), so it has to be sent with `ParseMode::Html`.
+fn confirmation_request(
+    bot: &Bot,
+    chat_id: ChatId,
+    reply: String,
+    lang: Language,
+    id: i64,
+) -> <Bot as Requester>::SendMessage {
+    bot.send_message(chat_id, reply)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(action_keyboard(lang, id))
 }
 
 fn action_keyboard(lang: Language, id: i64) -> InlineKeyboardMarkup {
@@ -266,27 +283,47 @@ async fn list(
         return Ok(());
     }
 
-    let mut out = String::from(m::list_header(lang));
-    out.push('\n');
+    let mut lines = Vec::with_capacity(alerts.len());
     for a in &alerts {
         let scope_icon = match a.scope {
             AlertScope::Private => "🔒",
             AlertScope::Shared => "👥",
         };
         let when = render::format_local_compact(a.fire_at, tz, lang);
-        let text = html_escape(&a.text);
-        let line = match render::format_recurrence_short(&a.schedule, lang) {
+        let text = truncate_chars(&a.text, limits::MAX_TEXT_LEN);
+        let raw_line = match render::format_recurrence_short(&a.schedule, lang) {
             Some(rec_short) => {
-                format!("\n{scope_icon}🔁 #{} · {when} · {rec_short} · {text}", a.id)
+                format!("{scope_icon}🔁 #{} · {when} · {rec_short} · {text}", a.id)
             }
-            None => format!("\n{scope_icon} #{} · {when} · {text}", a.id),
+            None => format!("{scope_icon} #{} · {when} · {text}", a.id),
         };
-        out.push_str(&line);
+        lines.push(ListLine {
+            visible_len: telegram_text_len(&raw_line),
+            html: html_escape(&raw_line),
+            raw: raw_line,
+        });
     }
 
-    bot.send_message(msg.chat.id, out)
-        .parse_mode(ParseMode::Html)
+    let pages = paginate_list(m::list_header(lang), &lines, 4000);
+    if pages.len() == 1 {
+        bot.send_message(msg.chat.id, &pages[0].html)
+            .parse_mode(ParseMode::Html)
+            .await?;
+    } else {
+        // Large lists would fan one inbound command out into many Telegram API
+        // calls and can trip the chat-wide send limit. A single text document
+        // keeps every line in one call.
+        let mut document = String::from(m::list_header(lang));
+        for line in &lines {
+            document.push('\n');
+            document.push_str(&line.raw);
+        }
+        bot.send_document(
+            msg.chat.id,
+            InputFile::memory(document.into_bytes()).file_name("alerts.txt"),
+        )
         .await?;
+    }
     Ok(())
 }
 
@@ -309,6 +346,17 @@ async fn cancel(
     }
     if !alert.can_edit(requester) {
         bot.send_message(msg.chat.id, m::cancel_not_allowed(lang)).await?;
+        return Ok(());
+    }
+    if alert.scope == AlertScope::Shared
+        && !shared_command_mutation_allowed(
+            bot,
+            msg.chat.id,
+            UserId(u64::try_from(requester)?),
+            lang,
+        )
+        .await?
+    {
         return Ok(());
     }
     let ok = store.cancel_alert(id, requester).await?;
@@ -473,6 +521,121 @@ async fn callback_alert_in_origin_chat(
     Ok(Some(alert))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedMembership {
+    Current,
+    NotCurrent,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BotGroupAuthority {
+    Privileged,
+    NotPrivileged,
+    Unavailable,
+}
+
+/// Shared reminders rely on Telegram membership lookups before every change.
+/// Telegram only guarantees those lookups while this bot is a group
+/// administrator, so creation must fail closed when that cannot be proved.
+async fn bot_group_authority(bot: &Bot, chat_id: ChatId) -> BotGroupAuthority {
+    let Some(bot_id) = bot_user_id(bot) else {
+        tracing::error!(
+            chat_id = chat_id.0,
+            "bot token has no valid numeric identity prefix"
+        );
+        return BotGroupAuthority::Unavailable;
+    };
+
+    match bot.get_chat_member(chat_id, bot_id).await {
+        Ok(member) if member.is_privileged() => BotGroupAuthority::Privileged,
+        Ok(_) => BotGroupAuthority::NotPrivileged,
+        Err(error) => {
+            tracing::warn!(
+                chat_id = chat_id.0,
+                error = ?error,
+                "bot administrator lookup failed before group alert creation"
+            );
+            BotGroupAuthority::Unavailable
+        }
+    }
+}
+
+fn bot_user_id(bot: &Bot) -> Option<UserId> {
+    let (id, _) = bot.token().split_once(':')?;
+    id.parse::<u64>().ok().map(UserId)
+}
+
+async fn group_alert_creation_allowed(
+    bot: &Bot,
+    chat_id: ChatId,
+    lang: Language,
+) -> Result<bool, teloxide::RequestError> {
+    let message = match bot_group_authority(bot, chat_id).await {
+        BotGroupAuthority::Privileged => return Ok(true),
+        BotGroupAuthority::NotPrivileged => m::group_alert_bot_admin_required(lang),
+        BotGroupAuthority::Unavailable => m::group_alert_bot_admin_check_failed(lang),
+    };
+    bot.send_message(chat_id, message).await?;
+    Ok(false)
+}
+
+/// Verify shared-alert authority against Telegram immediately before mutation.
+/// Telegram only guarantees `getChatMember` for other users when the bot is a
+/// chat administrator, so every API failure must deny the mutation.
+async fn shared_membership(bot: &Bot, chat_id: ChatId, requester: UserId) -> SharedMembership {
+    match bot.get_chat_member(chat_id, requester).await {
+        Ok(member) if member.is_present() => SharedMembership::Current,
+        Ok(_) => SharedMembership::NotCurrent,
+        Err(error) => {
+            tracing::warn!(
+                chat_id = chat_id.0,
+                requester = requester.0,
+                error = ?error,
+                "shared alert membership check failed"
+            );
+            SharedMembership::Unavailable
+        }
+    }
+}
+
+async fn shared_command_mutation_allowed(
+    bot: &Bot,
+    chat_id: ChatId,
+    requester: UserId,
+    lang: Language,
+) -> Result<bool, teloxide::RequestError> {
+    let message = match shared_membership(bot, chat_id, requester).await {
+        SharedMembership::Current => return Ok(true),
+        SharedMembership::NotCurrent => m::shared_membership_required(lang),
+        SharedMembership::Unavailable => m::shared_membership_check_failed(lang),
+    };
+    bot.send_message(chat_id, message).await?;
+    Ok(false)
+}
+
+async fn shared_callback_mutation_allowed(
+    bot: &Bot,
+    query: &CallbackQuery,
+    alert: &botcore::Alert,
+    lang: Language,
+) -> Result<bool, teloxide::RequestError> {
+    if alert.scope == AlertScope::Private {
+        return Ok(true);
+    }
+
+    let message = match shared_membership(bot, ChatId(alert.chat_id), query.from.id).await {
+        SharedMembership::Current => return Ok(true),
+        SharedMembership::NotCurrent => m::shared_membership_required(lang),
+        SharedMembership::Unavailable => m::shared_membership_check_failed(lang),
+    };
+    bot.answer_callback_query(query.id.clone())
+        .text(message)
+        .show_alert(true)
+        .await?;
+    Ok(false)
+}
+
 async fn handle_cancel_callback(
     bot: &Bot,
     store: &PgStore,
@@ -480,14 +643,14 @@ async fn handle_cancel_callback(
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
-    if callback_alert_in_origin_chat(store, query, alert_id)
-        .await?
-        .is_none()
-    {
+    let Some(alert) = callback_alert_in_origin_chat(store, query, alert_id).await? else {
         bot.answer_callback_query(query.id.clone())
             .text(m::cancel_not_allowed(lang))
             .show_alert(true)
             .await?;
+        return Ok(());
+    };
+    if !shared_callback_mutation_allowed(bot, query, &alert, lang).await? {
         return Ok(());
     }
     let requester = query.from.id.0 as i64;
@@ -536,6 +699,9 @@ async fn handle_snooze_callback(
             .await?;
         return Ok(());
     };
+    if !shared_callback_mutation_allowed(bot, query, &original, user.language).await? {
+        return Ok(());
+    }
 
     // Snooze creates a new alert, so it counts against both quotas the same
     // way as a fresh /alert command would. The errors get rendered as a
@@ -602,8 +768,9 @@ fn snooze_fire_at(offset_secs: i64, now: chrono::DateTime<Utc>) -> Option<chrono
 }
 
 /// Stop the recurring series: reuses the existing `cancel_alert` flow (which
-/// enforces `Alert::can_edit`). For shared galert anyone may stop; for private
-/// alerts only the creator. Falls back to a `not allowed` toast otherwise.
+/// enforces `Alert::can_edit`). For shared galert any current group member may
+/// stop; for private alerts only the creator. Falls back to a `not allowed`
+/// toast otherwise.
 async fn handle_stop_series_callback(
     bot: &Bot,
     store: &PgStore,
@@ -611,14 +778,14 @@ async fn handle_stop_series_callback(
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
-    if callback_alert_in_origin_chat(store, query, alert_id)
-        .await?
-        .is_none()
-    {
+    let Some(alert) = callback_alert_in_origin_chat(store, query, alert_id).await? else {
         bot.answer_callback_query(query.id.clone())
             .text(m::cancel_not_allowed(lang))
             .show_alert(true)
             .await?;
+        return Ok(());
+    };
+    if !shared_callback_mutation_allowed(bot, query, &alert, lang).await? {
         return Ok(());
     }
     let requester = query.from.id.0 as i64;
@@ -664,6 +831,10 @@ async fn clear_inline_buttons(bot: &Bot, query: &CallbackQuery) {
 // ---------------------------------------------------------------------------
 
 pub async fn handle_unhandled(bot: Bot, msg: Message, store: Arc<PgStore>) -> HandlerResult {
+    if let Some((from, to)) = chat_migration(&msg) {
+        store.migrate_chat(from.0, to.0).await?;
+        return Ok(());
+    }
     if !matches!(msg.chat.kind, ChatKind::Private(_)) {
         return Ok(());
     }
@@ -687,6 +858,15 @@ pub async fn handle_unhandled(bot: Bot, msg: Message, store: Arc<PgStore>) -> Ha
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Telegram announces a group-to-supergroup upgrade in both chats: the old
+/// group gets `migrate_to_chat_id`, the new supergroup `migrate_from_chat_id`.
+fn chat_migration(msg: &Message) -> Option<(ChatId, ChatId)> {
+    if let Some(to) = msg.migrate_to_chat_id() {
+        return Some((msg.chat.id, *to));
+    }
+    msg.migrate_from_chat_id().map(|from| (*from, msg.chat.id))
+}
+
 fn chat_type_from_msg(msg: &Message) -> ChatType {
     match &msg.chat.kind {
         ChatKind::Private(_) => ChatType::Private,
@@ -704,10 +884,291 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn truncate_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+#[derive(Debug)]
+struct ListLine {
+    html: String,
+    raw: String,
+    visible_len: usize,
+}
+
+#[derive(Debug)]
+struct ListPage {
+    html: String,
+    visible_len: usize,
+}
+
+fn paginate_list(header: &str, lines: &[ListLine], max_chars: usize) -> Vec<ListPage> {
+    let mut pages = Vec::new();
+    let header_html = format!("<b>{}</b>", html_escape(header));
+    let header_len = telegram_text_len(header);
+    let mut page = ListPage {
+        html: header_html.clone(),
+        visible_len: header_len,
+    };
+    for line in lines {
+        let added = 1 + line.visible_len;
+        if page.visible_len + added > max_chars && page.visible_len != header_len {
+            pages.push(page);
+            page = ListPage {
+                html: header_html.clone(),
+                visible_len: header_len,
+            };
+        }
+        page.html.push('\n');
+        page.html.push_str(&line.html);
+        page.visible_len += added;
+    }
+    if page.visible_len != header_len || lines.is_empty() {
+        pages.push(page);
+    }
+    pages
+}
+
+fn telegram_text_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use teloxide::requests::HasPayload;
     use teloxide::types::InlineKeyboardButtonKind;
+
+    const MEMBER: &str = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"member"}}"#;
+    const LEFT: &str = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"left"}}"#;
+    const LOOKUP_ERROR: &str =
+        r#"{"ok":false,"error_code":400,"description":"Bad Request: user not found"}"#;
+    const BOT_ADMIN: &str = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"administrator","can_be_edited":false,"is_anonymous":false,"can_manage_chat":true,"can_delete_messages":false,"can_manage_video_chats":false,"can_restrict_members":false,"can_promote_members":false,"can_change_info":false,"can_invite_users":false}}"#;
+    const BOT_MEMBER: &str = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"member"}}"#;
+
+    type Requests = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Answer `getChatMember` with `member_response`, acknowledge every other
+    /// Telegram method, and record each request path and body.
+    async fn mock_telegram(
+        member_response: &'static str,
+    ) -> (Bot, Requests, tokio::task::JoinHandle<()>) {
+        let requests = Requests::default();
+        let captured = Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let captured = Arc::clone(&captured);
+            async move {
+                let path = request.uri().path().to_string();
+                let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), String::from_utf8(body.to_vec()).unwrap()));
+                if path.ends_with("/GetChatMember") {
+                    member_response
+                } else if path.ends_with("/SendMessage") {
+                    r#"{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":-100,"type":"group"},"text":"status"}}"#
+                } else {
+                    r#"{"ok":true,"result":true}"#
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (Bot::new("123:test").set_api_url(url), requests, server)
+    }
+
+    fn recorded(requests: &Requests) -> Vec<(String, String)> {
+        requests.lock().unwrap().clone()
+    }
+
+    async fn membership_from_mock(response: &'static str) -> SharedMembership {
+        let (bot, _, server) = mock_telegram(response).await;
+        let result = shared_membership(&bot, ChatId(-100), UserId(42)).await;
+        server.abort();
+        result
+    }
+
+    async fn command_mutation_from_mock(
+        response: &'static str,
+        lang: Language,
+    ) -> (bool, Vec<(String, String)>) {
+        let (bot, requests, server) = mock_telegram(response).await;
+        let allowed = shared_command_mutation_allowed(&bot, ChatId(-100), UserId(42), lang)
+            .await
+            .unwrap();
+        server.abort();
+        (allowed, recorded(&requests))
+    }
+
+    async fn callback_mutation_from_mock(
+        response: &'static str,
+        scope: AlertScope,
+    ) -> (bool, Vec<(String, String)>) {
+        let (bot, requests, server) = mock_telegram(response).await;
+        let query: CallbackQuery = serde_json::from_str(
+            r#"{
+                "id":"callback-id",
+                "from":{"id":42,"is_bot":false,"first_name":"Test"},
+                "chat_instance":"instance-id",
+                "message":{"message_id":2,"date":1,"chat":{"id":-100,"type":"group"},"text":"alert"},
+                "data":"cancel:1"
+            }"#,
+        )
+        .unwrap();
+        let now = Utc::now();
+        let alert = botcore::Alert {
+            id: 1,
+            user_id: 7,
+            chat_id: -100,
+            chat_type: ChatType::Group,
+            scope,
+            text: "standup".into(),
+            fire_at: now,
+            schedule: botcore::Schedule::one_shot(now, chrono_tz::UTC),
+            state: botcore::AlertState::Pending,
+            attempts: 0,
+            last_error: None,
+            claimed_at: None,
+            claim_generation: 0,
+            fired_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let allowed = shared_callback_mutation_allowed(&bot, &query, &alert, Language::En)
+            .await
+            .unwrap();
+        server.abort();
+        (allowed, recorded(&requests))
+    }
+
+    async fn group_creation_from_mock(
+        bot_response: &'static str,
+        lang: Language,
+    ) -> (bool, Vec<(String, String)>) {
+        let (bot, requests, server) = mock_telegram(bot_response).await;
+        let allowed = group_alert_creation_allowed(&bot, ChatId(-100), lang)
+            .await
+            .unwrap();
+        server.abort();
+        (allowed, recorded(&requests))
+    }
+
+    #[tokio::test]
+    async fn shared_membership_accepts_current_members() {
+        assert_eq!(
+            membership_from_mock(MEMBER).await,
+            SharedMembership::Current
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_membership_rejects_users_who_left() {
+        assert_eq!(
+            membership_from_mock(LEFT).await,
+            SharedMembership::NotCurrent
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_membership_fails_closed_on_telegram_errors() {
+        assert_eq!(
+            membership_from_mock(LOOKUP_ERROR).await,
+            SharedMembership::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_cancel_command_accepts_current_members() {
+        let (allowed, requests) = command_mutation_from_mock(MEMBER, Language::En).await;
+        assert!(allowed);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.ends_with("/GetChatMember"));
+    }
+
+    #[tokio::test]
+    async fn shared_cancel_command_rejects_users_who_left() {
+        let (allowed, requests) = command_mutation_from_mock(LEFT, Language::En).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("/SendMessage"));
+        assert!(requests[1]
+            .1
+            .contains(m::shared_membership_required(Language::En)));
+    }
+
+    #[tokio::test]
+    async fn shared_cancel_command_fails_closed_when_membership_lookup_fails() {
+        let (allowed, requests) = command_mutation_from_mock(LOOKUP_ERROR, Language::De).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("/SendMessage"));
+        assert!(requests[1]
+            .1
+            .contains(m::shared_membership_check_failed(Language::De)));
+    }
+
+    #[tokio::test]
+    async fn shared_callbacks_reject_users_who_left() {
+        let (allowed, requests) = callback_mutation_from_mock(LEFT, AlertScope::Shared).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.ends_with("/GetChatMember"));
+        assert!(requests[1].0.ends_with("/AnswerCallbackQuery"));
+        assert!(requests[1]
+            .1
+            .contains(m::shared_membership_required(Language::En)));
+    }
+
+    #[tokio::test]
+    async fn private_callbacks_need_no_membership_lookup() {
+        let (allowed, requests) = callback_mutation_from_mock(LEFT, AlertScope::Private).await;
+        assert!(allowed);
+        assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn group_creation_accepts_only_when_bot_is_administrator() {
+        let (allowed, requests) = group_creation_from_mock(BOT_ADMIN, Language::En).await;
+        assert!(allowed);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.ends_with("/GetChatMember"));
+        assert!(requests[0].1.contains("\"user_id\":123"));
+    }
+
+    #[tokio::test]
+    async fn group_creation_rejects_non_administrator_bot() {
+        let (allowed, requests) = group_creation_from_mock(BOT_MEMBER, Language::De).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("/SendMessage"));
+        assert!(requests[1]
+            .1
+            .contains(m::group_alert_bot_admin_required(Language::De)));
+    }
+
+    #[tokio::test]
+    async fn group_creation_fails_closed_when_bot_role_lookup_fails() {
+        let (allowed, requests) = group_creation_from_mock(LOOKUP_ERROR, Language::En).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("/SendMessage"));
+        assert!(requests[1]
+            .1
+            .contains(m::group_alert_bot_admin_check_failed(Language::En)));
+    }
+
+    #[test]
+    fn bot_identity_comes_from_numeric_token_prefix() {
+        assert_eq!(bot_user_id(&Bot::new("123:test")), Some(UserId(123)));
+        assert_eq!(bot_user_id(&Bot::new("broken")), None);
+        assert_eq!(bot_user_id(&Bot::new("bot:test")), None);
+    }
 
     #[test]
     fn snooze_only_accepts_offered_intervals() {
@@ -739,11 +1200,106 @@ mod tests {
         assert_eq!(callback_data(&row[2]), "snooze:3600:42");
     }
 
+    /// The confirmation text carries pre-escaped HTML (`Tom &amp; Jerry`), so
+    /// it must be sent with `ParseMode::Html` or the entities show up as text.
+    #[test]
+    fn confirmation_is_sent_as_html() {
+        let bot = Bot::new("123:test-token");
+        let req = confirmation_request(&bot, ChatId(1), "Tom &amp; Jerry".into(), Language::De, 7);
+        assert_eq!(req.payload_ref().parse_mode, Some(ParseMode::Html));
+    }
+
     #[test]
     fn delivery_keyboard_recurring_adds_stop_series_button() {
         let kb = delivery_keyboard(Language::En, 7, true);
         let row = &kb.inline_keyboard[0];
         assert_eq!(row.len(), 4);
         assert_eq!(callback_data(&row[3]), "stop_series:7");
+    }
+
+    fn service_message(chat: serde_json::Value, field: &str, id: i64) -> Message {
+        let mut message = serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": chat,
+            "from": {"id": 42, "is_bot": false, "first_name": "Ada"},
+        });
+        message[field] = id.into();
+        serde_json::from_str(&message.to_string()).unwrap()
+    }
+
+    #[test]
+    fn chat_migration_is_read_from_both_service_messages() {
+        let old = service_message(
+            serde_json::json!({"id": -100, "type": "group", "title": "Team"}),
+            "migrate_to_chat_id",
+            -1_001_234,
+        );
+        assert_eq!(
+            chat_migration(&old),
+            Some((ChatId(-100), ChatId(-1_001_234)))
+        );
+        let new = service_message(
+            serde_json::json!({"id": -1_001_234, "type": "supergroup", "title": "Team"}),
+            "migrate_from_chat_id",
+            -100,
+        );
+        assert_eq!(
+            chat_migration(&new),
+            Some((ChatId(-100), ChatId(-1_001_234)))
+        );
+    }
+
+    #[test]
+    fn list_pages_stay_below_telegram_limit_and_keep_lines_whole() {
+        let lines: Vec<ListLine> = (0..50)
+            .map(|i| {
+                let raw = format!("#{i} {}", "&".repeat(500));
+                ListLine {
+                    visible_len: telegram_text_len(&raw),
+                    html: html_escape(&raw),
+                    raw,
+                }
+            })
+            .collect();
+        let pages = paginate_list("Header", &lines, 4000);
+        assert!(pages.len() > 1);
+        assert!(
+            pages.len() <= 8,
+            "escaped entities must not amplify page count"
+        );
+        assert!(pages.iter().all(|page| page.visible_len <= 4000));
+        for line in &lines {
+            assert_eq!(
+                pages
+                    .iter()
+                    .filter(|page| page.html.contains(&line.html))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_happens_before_html_expansion() {
+        let raw = format!("{}tail", "&".repeat(limits::MAX_TEXT_LEN));
+        let escaped = html_escape(&truncate_chars(&raw, limits::MAX_TEXT_LEN));
+        assert_eq!(escaped, "&amp;".repeat(limits::MAX_TEXT_LEN));
+    }
+
+    #[test]
+    fn list_limit_counts_non_bmp_characters_as_telegram_does() {
+        let raw_lines = ["🔒".repeat(1_999), "last".into()];
+        let lines: Vec<ListLine> = raw_lines
+            .iter()
+            .map(|raw| ListLine {
+                html: html_escape(raw),
+                raw: raw.to_string(),
+                visible_len: telegram_text_len(raw),
+            })
+            .collect();
+        let pages = paginate_list("h", &lines, 4000);
+        assert_eq!(pages.len(), 2);
+        assert!(pages.iter().all(|page| page.visible_len <= 4000));
     }
 }

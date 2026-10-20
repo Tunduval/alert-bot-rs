@@ -8,12 +8,15 @@
 //!  3. Atomically claim one due alert via `FOR UPDATE SKIP LOCKED`.
 //!  4. For each: send via Bot API, mark sent. On 429 reschedule, on 4xx other
 //!     than 429 mark failed, on transient error retry up to MAX_ATTEMPTS.
+//!     A recurring alert then skips only the failed occurrence.
+//!     If the group became a supergroup, move its alerts and retry.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgListener;
+use sqlx::postgres::{PgListener, PgNotification};
 use teloxide::prelude::*;
 use teloxide::ApiError;
 use tokio_util::sync::CancellationToken;
@@ -60,7 +63,8 @@ pub async fn run(bot: Bot, store: Arc<PgStore>, shutdown: CancellationToken) -> 
                 info!("worker shutting down");
                 return Ok(());
             }
-            _ = listener.recv() => {
+            notification = listener.recv() => {
+                require_notification(notification)?;
                 debug!("worker woke on NOTIFY");
             }
             _ = sleep_until(next_wake) => {
@@ -135,6 +139,23 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
                 error!(id = alert.id, error = ?e, "reschedule failed");
             }
         }
+        Err(teloxide::RequestError::MigrateToChatId(new_chat_id)) => {
+            info!(
+                id = alert.id,
+                from = alert.chat_id,
+                to = new_chat_id.0,
+                "group migrated to a supergroup"
+            );
+            if let Err(e) = store.migrate_chat(alert.chat_id, new_chat_id.0).await {
+                error!(id = alert.id, error = ?e, "chat migration failed");
+            }
+            if let Err(e) = store
+                .reschedule(alert.id, alert.claim_generation, Utc::now())
+                .await
+            {
+                error!(id = alert.id, error = ?e, "reschedule failed");
+            }
+        }
         Err(teloxide::RequestError::Api(ApiError::BotBlocked))
         | Err(teloxide::RequestError::Api(ApiError::ChatNotFound))
         | Err(teloxide::RequestError::Api(ApiError::UserDeactivated)) => {
@@ -156,11 +177,8 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
             if alert.attempts >= MAX_ATTEMPTS {
                 let msg = format!("max attempts: {e}");
                 warn!(id = alert.id, attempts = alert.attempts, "giving up");
-                if let Err(e) = store
-                    .mark_failed(alert.id, alert.claim_generation, &msg)
-                    .await
-                {
-                    error!(id = alert.id, error = ?e, "mark_failed failed");
+                if let Err(e) = give_up_occurrence(store, &alert, &msg).await {
+                    error!(id = alert.id, error = ?e, "giving up failed");
                 }
             } else {
                 let backoff = 5_i64 << alert.attempts.min(6);
@@ -211,6 +229,29 @@ async fn finalise_after_send(store: &PgStore, alert: &Alert) -> anyhow::Result<(
     Ok(())
 }
 
+/// A transient outage must not end a recurring series. Give up on this
+/// occurrence only and queue the next one; one-shots are marked failed.
+async fn give_up_occurrence(store: &PgStore, alert: &Alert, error: &str) -> anyhow::Result<()> {
+    let next = if alert.schedule.is_recurring() {
+        alert.schedule.next_after(Utc::now())
+    } else {
+        None
+    };
+    match next {
+        Some(next) => {
+            store
+                .advance_to_next_occurrence(alert.id, alert.claim_generation, next)
+                .await?;
+        }
+        None => {
+            store
+                .mark_failed(alert.id, alert.claim_generation, error)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn compute_next_wake(store: &PgStore) -> DateTime<Utc> {
     match store.next_pending_fire_at().await {
         Ok(Some(t)) => t,
@@ -248,6 +289,12 @@ async fn reaper_loop(store: Arc<PgStore>, shutdown: CancellationToken) {
             Err(e) => error!(error = ?e, "purge_old_updates failed"),
         }
     }
+}
+
+fn require_notification(notification: Result<PgNotification, sqlx::Error>) -> anyhow::Result<()> {
+    notification
+        .map(|_| ())
+        .context("receiving alerts_changed notification")
 }
 
 #[cfg(test)]
@@ -321,6 +368,119 @@ mod tests {
             AlertState::Sent
         );
         server.abort();
+        store.pool().close().await;
+    }
+
+    #[test]
+    fn listener_errors_stop_the_worker_instead_of_spinning() {
+        let error = require_notification(Err(sqlx::Error::PoolClosed)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("receiving alerts_changed notification"));
+    }
+
+    async fn deliver_after_last_transient_failure(
+        pool: PgPool,
+        schedule: impl Fn(DateTime<Utc>) -> Schedule,
+    ) -> Alert {
+        let store = PgStore::connect(pool.connect_options().to_url_lossy().as_str(), 5)
+            .await
+            .unwrap();
+        store.upsert_user(42, Language::En).await.unwrap();
+        let at = Utc::now() - chrono::Duration::seconds(1);
+        let alert = store
+            .create_alert(NewAlert {
+                user_id: 42,
+                chat_id: 42,
+                chat_type: ChatType::Private,
+                scope: AlertScope::Private,
+                text: "test".into(),
+                fire_at: at,
+                schedule: schedule(at),
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE alerts SET attempts = $2 WHERE id = $1")
+            .bind(alert.id)
+            .bind(MAX_ATTEMPTS - 1)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        process_due(&Bot::new("123:test").set_api_url(url), &store)
+            .await
+            .unwrap();
+        server.abort();
+        let after = store.get_alert(alert.id).await.unwrap().unwrap();
+        store.pool().close().await;
+        after
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn transient_failures_skip_only_the_current_recurring_occurrence(pool: PgPool) {
+        let after = deliver_after_last_transient_failure(pool, |at| {
+            Schedule::daily_at(at, chrono_tz::UTC, 1, at.time()).unwrap()
+        })
+        .await;
+        assert_eq!(after.state, AlertState::Pending);
+        assert_eq!(after.attempts, 0);
+        assert!(after.fire_at > Utc::now());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn transient_failures_still_fail_one_shot_alerts(pool: PgPool) {
+        let after =
+            deliver_after_last_transient_failure(pool, |at| Schedule::one_shot(at, chrono_tz::UTC))
+                .await;
+        assert_eq!(after.state, AlertState::Failed);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn supergroup_migration_moves_the_alert_and_retries(pool: PgPool) {
+        let store = PgStore::connect(pool.connect_options().to_url_lossy().as_str(), 5)
+            .await
+            .unwrap();
+        store.upsert_user(42, Language::En).await.unwrap();
+        let at = Utc::now() - chrono::Duration::seconds(1);
+        let alert = store
+            .create_alert(NewAlert {
+                user_id: 42,
+                chat_id: -100,
+                chat_type: ChatType::Group,
+                scope: AlertScope::Shared,
+                text: "standup".into(),
+                fire_at: at,
+                schedule: Schedule::one_shot(at, chrono_tz::UTC),
+            })
+            .await
+            .unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: group chat was upgraded to a supergroup chat","parameters":{"migrate_to_chat_id":-1001234}}"#
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        process_due(&Bot::new("123:test").set_api_url(url), &store)
+            .await
+            .unwrap();
+        server.abort();
+        let after = store.get_alert(alert.id).await.unwrap().unwrap();
+        assert_eq!(after.chat_id, -1_001_234);
+        assert_eq!(after.chat_type, ChatType::Supergroup);
+        assert_eq!(after.state, AlertState::Pending);
+        assert!(after.fire_at <= Utc::now());
         store.pool().close().await;
     }
 }
