@@ -6,7 +6,7 @@ use chrono::Utc;
 use chrono_tz::Tz;
 use teloxide::prelude::*;
 use teloxide::types::{
-    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode,
+    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode,
     PublicChatKind, Recipient,
 };
 
@@ -266,27 +266,47 @@ async fn list(
         return Ok(());
     }
 
-    let mut out = String::from(m::list_header(lang));
-    out.push('\n');
+    let mut lines = Vec::with_capacity(alerts.len());
     for a in &alerts {
         let scope_icon = match a.scope {
             AlertScope::Private => "🔒",
             AlertScope::Shared => "👥",
         };
         let when = render::format_local_compact(a.fire_at, tz, lang);
-        let text = html_escape(&a.text);
-        let line = match render::format_recurrence_short(&a.schedule, lang) {
+        let text = truncate_chars(&a.text, limits::MAX_TEXT_LEN);
+        let raw_line = match render::format_recurrence_short(&a.schedule, lang) {
             Some(rec_short) => {
-                format!("\n{scope_icon}🔁 #{} · {when} · {rec_short} · {text}", a.id)
+                format!("{scope_icon}🔁 #{} · {when} · {rec_short} · {text}", a.id)
             }
-            None => format!("\n{scope_icon} #{} · {when} · {text}", a.id),
+            None => format!("{scope_icon} #{} · {when} · {text}", a.id),
         };
-        out.push_str(&line);
+        lines.push(ListLine {
+            visible_len: telegram_text_len(&raw_line),
+            html: html_escape(&raw_line),
+            raw: raw_line,
+        });
     }
 
-    bot.send_message(msg.chat.id, out)
-        .parse_mode(ParseMode::Html)
+    let pages = paginate_list(m::list_header(lang), &lines, 4000);
+    if pages.len() == 1 {
+        bot.send_message(msg.chat.id, &pages[0].html)
+            .parse_mode(ParseMode::Html)
+            .await?;
+    } else {
+        // Large lists would fan one inbound command out into many Telegram API
+        // calls and can trip the chat-wide send limit. A single text document
+        // keeps every line in one call.
+        let mut document = String::from(m::list_header(lang));
+        for line in &lines {
+            document.push('\n');
+            document.push_str(&line.raw);
+        }
+        bot.send_document(
+            msg.chat.id,
+            InputFile::memory(document.into_bytes()).file_name("alerts.txt"),
+        )
         .await?;
+    }
     Ok(())
 }
 
@@ -717,6 +737,54 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn truncate_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+#[derive(Debug)]
+struct ListLine {
+    html: String,
+    raw: String,
+    visible_len: usize,
+}
+
+#[derive(Debug)]
+struct ListPage {
+    html: String,
+    visible_len: usize,
+}
+
+fn paginate_list(header: &str, lines: &[ListLine], max_chars: usize) -> Vec<ListPage> {
+    let mut pages = Vec::new();
+    let header_html = format!("<b>{}</b>", html_escape(header));
+    let header_len = telegram_text_len(header);
+    let mut page = ListPage {
+        html: header_html.clone(),
+        visible_len: header_len,
+    };
+    for line in lines {
+        let added = 1 + line.visible_len;
+        if page.visible_len + added > max_chars && page.visible_len != header_len {
+            pages.push(page);
+            page = ListPage {
+                html: header_html.clone(),
+                visible_len: header_len,
+            };
+        }
+        page.html.push('\n');
+        page.html.push_str(&line.html);
+        page.visible_len += added;
+    }
+    if page.visible_len != header_len || lines.is_empty() {
+        pages.push(page);
+    }
+    pages
+}
+
+fn telegram_text_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +859,58 @@ mod tests {
             chat_migration(&new),
             Some((ChatId(-100), ChatId(-1_001_234)))
         );
+    }
+
+    #[test]
+    fn list_pages_stay_below_telegram_limit_and_keep_lines_whole() {
+        let lines: Vec<ListLine> = (0..50)
+            .map(|i| {
+                let raw = format!("#{i} {}", "&".repeat(500));
+                ListLine {
+                    visible_len: telegram_text_len(&raw),
+                    html: html_escape(&raw),
+                    raw,
+                }
+            })
+            .collect();
+        let pages = paginate_list("Header", &lines, 4000);
+        assert!(pages.len() > 1);
+        assert!(
+            pages.len() <= 8,
+            "escaped entities must not amplify page count"
+        );
+        assert!(pages.iter().all(|page| page.visible_len <= 4000));
+        for line in &lines {
+            assert_eq!(
+                pages
+                    .iter()
+                    .filter(|page| page.html.contains(&line.html))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_happens_before_html_expansion() {
+        let raw = format!("{}tail", "&".repeat(limits::MAX_TEXT_LEN));
+        let escaped = html_escape(&truncate_chars(&raw, limits::MAX_TEXT_LEN));
+        assert_eq!(escaped, "&amp;".repeat(limits::MAX_TEXT_LEN));
+    }
+
+    #[test]
+    fn list_limit_counts_non_bmp_characters_as_telegram_does() {
+        let raw_lines = ["🔒".repeat(1_999), "last".into()];
+        let lines: Vec<ListLine> = raw_lines
+            .iter()
+            .map(|raw| ListLine {
+                html: html_escape(raw),
+                raw: raw.to_string(),
+                visible_len: telegram_text_len(raw),
+            })
+            .collect();
+        let pages = paginate_list("h", &lines, 4000);
+        assert_eq!(pages.len(), 2);
+        assert!(pages.iter().all(|page| page.visible_len <= 4000));
     }
 }
