@@ -45,7 +45,12 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
   a hint to use bare clock-time instead.
 - **Group reminders with two scopes**
   - `/alert` in a group fires in the group, but only the creator can cancel it.
-  - `/galert` is a shared group reminder; anyone in the chat can cancel.
+  - `/galert` is a shared group reminder; any current member can cancel it,
+    snooze it, or stop its series. The bot must be a group administrator so it
+    can check membership with Telegram. Failed checks leave the reminder
+    unchanged. When upgrading, make the bot an administrator in every group
+    that already has `/galert` reminders; otherwise members may be unable to
+    cancel, snooze, or stop them.
 - **Delivery controls** — snooze by 5 minutes, 15 minutes or 1 hour; stop a
   recurring series directly from its delivered message.
 - **Per-user language and timezone** — auto-detected from Telegram's
@@ -159,7 +164,21 @@ sudo -u alertbot psql -d alertbot -c "SELECT count(*) FROM pg_tables WHERE schem
 ```
 
 No password is stored anywhere — peer auth via the Unix socket binds
-identity to the calling system user.
+identity to the calling system user. To keep it that way, put these rules
+before every generic `local` or `host` rule in
+`/etc/postgresql/<major>/main/pg_hba.conf` and reload PostgreSQL. They let the
+`alertbot` role reach only its own database over the socket and reject it on
+TCP, so a later password rule can't become a second way in:
+
+```text
+local   alertbot   alertbot   peer
+local   all        alertbot   reject
+host    all        alertbot   0.0.0.0/0   reject
+host    all        alertbot   ::0/0       reject
+```
+
+The bot sets `lock_timeout = 5s` and `statement_timeout = 30s` on every
+connection, so a stuck lock can't hold the pool forever.
 
 #### 3. Install the systemd unit + config file
 
