@@ -136,6 +136,11 @@ async fn create_alert(
         .await?;
         return Ok(());
     }
+    if chat_type.is_group()
+        && !group_alert_creation_allowed(bot, msg.chat.id, user.language).await?
+    {
+        return Ok(());
+    }
     let new = NewAlert {
         user_id: user.telegram_id,
         chat_id: msg.chat.id.0,
@@ -329,29 +334,31 @@ async fn cancel(
     }
     let admin_override = match alert.scope {
         AlertScope::Shared => false,
-        AlertScope::Private => match private_cancel_authority(
-            bot,
-            &alert,
-            msg.chat.id.0,
-            &origin_chat_type,
-            requester,
-        )
-        .await
-        {
-            PrivateCancelAuthority::Owner => false,
-            PrivateCancelAuthority::GroupAdmin => true,
-            PrivateCancelAuthority::Denied => {
-                bot.send_message(msg.chat.id, m::cancel_not_allowed(lang))
-                    .await?;
-                return Ok(());
+        AlertScope::Private => {
+            match private_cancel_authority(bot, &alert, msg.chat.id.0, &origin_chat_type, requester)
+                .await
+            {
+                PrivateCancelAuthority::Owner => false,
+                PrivateCancelAuthority::GroupAdmin => true,
+                PrivateCancelAuthority::Denied => {
+                    bot.send_message(msg.chat.id, m::cancel_not_allowed(lang))
+                        .await?;
+                    return Ok(());
+                }
+                PrivateCancelAuthority::Unavailable => {
+                    bot.send_message(msg.chat.id, m::group_admin_check_failed(lang))
+                        .await?;
+                    return Ok(());
+                }
             }
-            PrivateCancelAuthority::Unavailable => {
-                bot.send_message(msg.chat.id, m::group_admin_check_failed(lang))
-                    .await?;
-                return Ok(());
-            }
-        },
+        }
     };
+    let telegram_requester = UserId(u64::try_from(requester)?);
+    if alert.scope == AlertScope::Shared
+        && !shared_command_mutation_allowed(bot, msg.chat.id, telegram_requester, lang).await?
+    {
+        return Ok(());
+    }
     let reply = match store
         .cancel_alert(
             id,
@@ -523,6 +530,13 @@ enum SharedMembership {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BotGroupAuthority {
+    Privileged,
+    NotPrivileged,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivateCancelAuthority {
     Owner,
     GroupAdmin,
@@ -532,6 +546,52 @@ enum PrivateCancelAuthority {
 
 fn alert_has_origin(alert: &botcore::Alert, chat_id: i64, chat_type: &ChatType) -> bool {
     alert.chat_id == chat_id && &alert.chat_type == chat_type
+}
+
+/// Group reminders rely on Telegram membership and administrator lookups for
+/// safe cleanup. Telegram only guarantees those lookups while this bot is a
+/// group administrator, so creation must fail closed when that prerequisite
+/// cannot be proved.
+async fn bot_group_authority(bot: &Bot, chat_id: ChatId) -> BotGroupAuthority {
+    let Some(bot_id) = bot_user_id(bot) else {
+        tracing::error!(
+            chat_id = chat_id.0,
+            "bot token has no valid numeric identity prefix"
+        );
+        return BotGroupAuthority::Unavailable;
+    };
+
+    match bot.get_chat_member(chat_id, bot_id).await {
+        Ok(member) if member.is_privileged() => BotGroupAuthority::Privileged,
+        Ok(_) => BotGroupAuthority::NotPrivileged,
+        Err(error) => {
+            tracing::warn!(
+                chat_id = chat_id.0,
+                error = ?error,
+                "bot administrator lookup failed before group alert creation"
+            );
+            BotGroupAuthority::Unavailable
+        }
+    }
+}
+
+fn bot_user_id(bot: &Bot) -> Option<UserId> {
+    let (id, _) = bot.token().split_once(':')?;
+    id.parse::<u64>().ok().map(UserId)
+}
+
+async fn group_alert_creation_allowed(
+    bot: &Bot,
+    chat_id: ChatId,
+    lang: Language,
+) -> Result<bool, teloxide::RequestError> {
+    let message = match bot_group_authority(bot, chat_id).await {
+        BotGroupAuthority::Privileged => return Ok(true),
+        BotGroupAuthority::NotPrivileged => m::group_alert_bot_admin_required(lang),
+        BotGroupAuthority::Unavailable => m::group_alert_bot_admin_check_failed(lang),
+    };
+    bot.send_message(chat_id, message).await?;
+    Ok(false)
 }
 
 /// Resolve authority for a private cancellation. The exact origin check comes
@@ -559,9 +619,12 @@ async fn private_cancel_authority(
 
     match bot.get_chat_administrators(ChatId(alert.chat_id)).await {
         Ok(admins)
-            if admins.iter().any(|member| {
-                identity::user_id(member.user.id.0) == Some(requester_user_id)
-            }) => PrivateCancelAuthority::GroupAdmin,
+            if admins
+                .iter()
+                .any(|member| identity::user_id(member.user.id.0) == Some(requester_user_id)) =>
+        {
+            PrivateCancelAuthority::GroupAdmin
+        }
         Ok(_) => PrivateCancelAuthority::Denied,
         Err(error) => {
             tracing::warn!(
@@ -587,11 +650,26 @@ async fn shared_membership(bot: &Bot, chat_id: ChatId, requester: UserId) -> Sha
                 chat_id = chat_id.0,
                 requester = requester.0,
                 error = ?error,
-                "shared callback membership check failed"
+                "shared alert membership check failed"
             );
             SharedMembership::Unavailable
         }
     }
+}
+
+async fn shared_command_mutation_allowed(
+    bot: &Bot,
+    chat_id: ChatId,
+    requester: UserId,
+    lang: Language,
+) -> Result<bool, teloxide::RequestError> {
+    let message = match shared_membership(bot, chat_id, requester).await {
+        SharedMembership::Current => return Ok(true),
+        SharedMembership::NotCurrent => m::shared_membership_required(lang),
+        SharedMembership::Unavailable => m::shared_membership_check_failed(lang),
+    };
+    bot.send_message(chat_id, message).await?;
+    Ok(false)
 }
 
 async fn shared_callback_mutation_allowed(
@@ -1052,6 +1130,7 @@ fn telegram_text_len(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use teloxide::types::InlineKeyboardButtonKind;
 
     async fn membership_from_mock(response: &'static str) -> SharedMembership {
@@ -1069,6 +1148,91 @@ mod tests {
         .await;
         server.abort();
         result
+    }
+
+    async fn command_membership_from_mock(
+        membership_response: &'static str,
+        lang: Language,
+    ) -> (bool, Vec<(String, String)>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let captured = Arc::clone(&captured);
+            async move {
+                let path = request.uri().path().to_string();
+                let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), String::from_utf8(body.to_vec()).unwrap()));
+                if path.ends_with("/getChatMember") {
+                    membership_response
+                } else {
+                    r#"{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":-100,"type":"group"},"text":"status"}}"#
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let allowed = shared_command_mutation_allowed(
+            &Bot::new("123:test").set_api_url(url),
+            ChatId(-100),
+            UserId(42),
+            lang,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        let captured = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+        (allowed, captured)
+    }
+
+    async fn group_creation_from_mock(
+        membership_response: &'static str,
+        lang: Language,
+    ) -> (bool, Vec<(String, String)>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let captured = Arc::clone(&captured);
+            async move {
+                let path = request.uri().path().to_string();
+                let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), String::from_utf8(body.to_vec()).unwrap()));
+                if path.ends_with("/getChatMember") {
+                    membership_response
+                } else {
+                    r#"{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":-100,"type":"group"},"text":"status"}}"#
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let allowed = group_alert_creation_allowed(
+            &Bot::new("123:test").set_api_url(url),
+            ChatId(-100),
+            lang,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        let captured = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+        (allowed, captured)
     }
 
     fn private_alert(chat_id: i64, chat_type: ChatType) -> botcore::Alert {
@@ -1147,6 +1311,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_creation_accepts_only_when_bot_is_administrator() {
+        let administrator = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"administrator","can_be_edited":false,"is_anonymous":false,"can_manage_chat":true,"can_delete_messages":false,"can_manage_video_chats":false,"can_restrict_members":false,"can_promote_members":false,"can_change_info":false,"can_invite_users":false}}"#;
+        let (allowed, requests) = group_creation_from_mock(administrator, Language::En).await;
+        assert!(allowed);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.ends_with("/getChatMember"));
+        assert!(requests[0].1.contains("123"));
+    }
+
+    #[tokio::test]
+    async fn group_creation_rejects_non_administrator_bot() {
+        let member = r#"{"ok":true,"result":{"user":{"id":123,"is_bot":true,"first_name":"Test Bot","username":"test_bot"},"status":"member"}}"#;
+        let (allowed, requests) = group_creation_from_mock(member, Language::De).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("/sendMessage"));
+        assert!(requests[1]
+            .1
+            .contains(m::group_alert_bot_admin_required(Language::De)));
+    }
+
+    #[tokio::test]
+    async fn group_creation_fails_closed_when_bot_role_lookup_fails() {
+        let error = r#"{"ok":false,"error_code":400,"description":"Bad Request"}"#;
+        let (allowed, requests) = group_creation_from_mock(error, Language::En).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("/sendMessage"));
+        assert!(requests[1]
+            .1
+            .contains(m::group_alert_bot_admin_check_failed(Language::En)));
+    }
+
+    #[test]
+    fn bot_identity_comes_from_numeric_token_prefix() {
+        assert_eq!(bot_user_id(&Bot::new("123:test")), Some(UserId(123)));
+        assert_eq!(bot_user_id(&Bot::new("broken")), None);
+        assert_eq!(bot_user_id(&Bot::new("bot:test")), None);
+    }
+
+    #[tokio::test]
+    async fn shared_cancel_command_accepts_current_members_immediately_before_mutation() {
+        let response = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"member"}}"#;
+        let (allowed, requests) = command_membership_from_mock(response, Language::En).await;
+        assert!(allowed);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.ends_with("/getChatMember"));
+    }
+
+    #[tokio::test]
+    async fn shared_cancel_command_rejects_users_who_left() {
+        let response = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"left"}}"#;
+        let (allowed, requests) = command_membership_from_mock(response, Language::En).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("/sendMessage"));
+        assert!(requests[1]
+            .1
+            .contains(m::shared_membership_required(Language::En)));
+    }
+
+    #[tokio::test]
+    async fn shared_cancel_command_fails_closed_when_membership_lookup_fails() {
+        let response =
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: user not found"}"#;
+        let (allowed, requests) = command_membership_from_mock(response, Language::De).await;
+        assert!(!allowed);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("/sendMessage"));
+        assert!(requests[1]
+            .1
+            .contains(m::shared_membership_check_failed(Language::De)));
+    }
+
+    #[tokio::test]
     async fn private_owner_cancels_without_telegram_lookup() {
         let alert = private_alert(-100, ChatType::Group);
         assert_eq!(
@@ -1167,14 +1406,7 @@ mod tests {
         let alert = private_alert(-100, ChatType::Group);
         let response = r#"{"ok":true,"result":[{"user":{"id":7,"is_bot":false,"first_name":"Admin"},"status":"creator","is_anonymous":false}]}"#;
         assert_eq!(
-            private_authority_from_mock(
-                response,
-                &alert,
-                -100,
-                &ChatType::Group,
-                7,
-            )
-            .await,
+            private_authority_from_mock(response, &alert, -100, &ChatType::Group, 7,).await,
             PrivateCancelAuthority::GroupAdmin
         );
     }
@@ -1216,27 +1448,15 @@ mod tests {
         let group_alert = private_alert(-100, ChatType::Group);
         let visible_admin = r#"{"ok":true,"result":[{"user":{"id":7,"is_bot":false,"first_name":"Admin"},"status":"creator","is_anonymous":false}]}"#;
         assert_eq!(
-            private_authority_from_mock(
-                visible_admin,
-                &group_alert,
-                -200,
-                &ChatType::Group,
-                7,
-            )
-            .await,
+            private_authority_from_mock(visible_admin, &group_alert, -200, &ChatType::Group, 7,)
+                .await,
             PrivateCancelAuthority::Denied
         );
 
         let private_alert = private_alert(7, ChatType::Private);
         assert_eq!(
-            private_authority_from_mock(
-                visible_admin,
-                &private_alert,
-                7,
-                &ChatType::Private,
-                8,
-            )
-            .await,
+            private_authority_from_mock(visible_admin, &private_alert, 7, &ChatType::Private, 8,)
+                .await,
             PrivateCancelAuthority::Denied
         );
     }

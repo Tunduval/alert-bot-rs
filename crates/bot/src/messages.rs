@@ -16,12 +16,9 @@ pub fn command_menu(lang: Language) -> Vec<(&'static str, &'static str)> {
             ("help", "zeigt alle Befehle und Beispiele"),
             (
                 "alert",
-                "Reminder — nur du kannst ihn löschen (DM und Gruppen)",
+                "Reminder — in DMs nur du; in Gruppen auch sichtbare Admins",
             ),
-            (
-                "galert",
-                "Gruppen-Reminder — jeder im Chat kann ihn löschen",
-            ),
+            ("galert", "Gruppen-Reminder — Bot muss Gruppenadmin sein"),
             ("list", "listet aktive Reminder im aktuellen Chat"),
             ("cancel", "löscht einen Reminder per ID"),
             ("tz", "setzt deine Zeitzone, z.B. Europe/Berlin"),
@@ -32,11 +29,11 @@ pub fn command_menu(lang: Language) -> Vec<(&'static str, &'static str)> {
             ("help", "show all commands and examples"),
             (
                 "alert",
-                "reminder — only you can cancel it (DMs and groups)",
+                "reminder — owner-only in DMs; visible group admins can cancel",
             ),
             (
                 "galert",
-                "group reminder — anyone in the chat can cancel it",
+                "group reminder — bot must be a group administrator",
             ),
             ("list", "show active reminders in the current chat"),
             ("cancel", "delete a reminder by id"),
@@ -53,8 +50,9 @@ pub fn welcome(lang: Language) -> &'static str {
             /alert 5m Kaffee fertig\n\
             /alert 30.4.26 Steuererklärung\n\
             /alert do 14:00 Standup\n\n\
-            In Gruppen funktionieren beide: /alert für deine eigenen Reminder, \
-            /galert wenn ihn jeder verwalten können soll.\n\
+            In Gruppen gehört /alert dir; sichtbare Gruppenadmins können ihn ebenfalls löschen. \
+            /galert können alle aktuellen Mitglieder verwalten. Der Bot muss Gruppenadmin sein. \
+            Snoozes bleiben privat und können nur von dir gelöscht werden.\n\
             /help zeigt alle Befehle."
         }
         Language::En => {
@@ -62,8 +60,9 @@ pub fn welcome(lang: Language) -> &'static str {
             /alert 5m coffee ready\n\
             /alert 30.4.26 file taxes\n\
             /alert thu 14:00 standup\n\n\
-            Both work in groups: /alert for your own reminders, /galert when \
-            anyone in the chat should be able to manage it.\n\
+            In groups, /alert belongs to you; visible group admins can also cancel it. \
+            Any current member can manage /galert. The bot must be a group administrator. \
+            Snoozes stay private and only you can cancel them.\n\
             /help lists every command."
         }
     }
@@ -73,8 +72,8 @@ pub fn help(lang: Language) -> &'static str {
     match lang {
         Language::De => {
             "<b>Befehle</b>\n\
-            /alert &lt;zeit&gt; &lt;text&gt; — Reminder. Nur du kannst ihn löschen.\n\
-            /galert &lt;zeit&gt; &lt;text&gt; — Gruppen-Reminder. Jeder im Chat kann löschen.\n\
+            /alert &lt;zeit&gt; &lt;text&gt; — Reminder. In DMs nur du; in Gruppen du oder sichtbare Admins.\n\
+            /galert &lt;zeit&gt; &lt;text&gt; — Gruppen-Reminder. Jedes aktuelle Mitglied kann löschen.\n\
             /list — aktive Reminder anzeigen\n\
             /cancel &lt;id&gt; — Reminder löschen\n\
             /tz &lt;zone&gt; — Zeitzone (z.B. Europe/Berlin)\n\
@@ -128,12 +127,14 @@ pub fn help(lang: Language) -> &'static str {
             • <b>m</b> = Minuten, <b>M</b> = Monate (Groß/klein zählt!)\n\
             • Tippfehler werden korrigiert: donnerstah → Donnerstag\n\
             • Mindestintervall 30 Min, Max einmalig 50 Jahre\n\
+            • Gruppen-Reminder brauchen den Bot als Gruppenadmin\n\
+            • Snoozes bleiben privat und können nur vom Ersteller gelöscht werden\n\
             • <i>heute</i>/<i>today</i> ist absichtlich raus — nimm direkt die Uhrzeit"
         }
         Language::En => {
             "<b>Commands</b>\n\
-            /alert &lt;time&gt; &lt;text&gt; — reminder. Only you can cancel it.\n\
-            /galert &lt;time&gt; &lt;text&gt; — group reminder. Anyone in the chat can cancel.\n\
+            /alert &lt;time&gt; &lt;text&gt; — reminder. In DMs only you; in groups you or visible admins.\n\
+            /galert &lt;time&gt; &lt;text&gt; — group reminder. Any current member can cancel.\n\
             /list — show active reminders\n\
             /cancel &lt;id&gt; — delete a reminder\n\
             /tz &lt;zone&gt; — set timezone (e.g. Europe/Berlin)\n\
@@ -186,6 +187,8 @@ pub fn help(lang: Language) -> &'static str {
             • <b>m</b> = minutes, <b>M</b> = months (case matters!)\n\
             • Typos are auto-corrected: thurzday → Thursday\n\
             • Minimum interval 30 min, max one-shot offset 50 years\n\
+            • Group reminders require the bot to be a group administrator\n\
+            • Snoozes stay private and only their creator can cancel them\n\
             • <i>today</i>/<i>heute</i> is deliberately rejected — use the clock time directly"
         }
     }
@@ -509,6 +512,26 @@ pub fn group_admin_check_failed(lang: Language) -> &'static str {
         Language::En => {
             "I couldn't verify your group administrator status. The reminder was not changed."
         }
+    }
+}
+
+pub fn group_alert_bot_admin_required(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Ich muss Gruppenadmin sein, damit Gruppen-Reminder sicher löschbar bleiben. Es wurde nichts angelegt."
+        }
+        Language::En => {
+            "I must be a group administrator so group reminders remain safely cancellable. Nothing was created."
+        }
+    }
+}
+
+pub fn group_alert_bot_admin_check_failed(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Ich konnte meine Gruppenadmin-Rolle nicht prüfen. Es wurde nichts angelegt."
+        }
+        Language::En => "I couldn't verify my group administrator role. Nothing was created.",
     }
 }
 

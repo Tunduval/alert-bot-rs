@@ -16,10 +16,10 @@ pub enum Command {
     #[command(description = "zeigt alle Befehle und Beispiele")]
     Help,
 
-    #[command(description = "neuer Reminder, privat — nur du kannst ihn editieren")]
+    #[command(description = "neuer Reminder — in Gruppen auch durch sichtbare Admins löschbar")]
     Alert(String),
 
-    #[command(description = "Gruppen-Reminder — jeder im Chat kann ihn editieren")]
+    #[command(description = "Gruppen-Reminder — Bot-Adminrolle erforderlich")]
     Galert(String),
 
     #[command(description = "listet aktive Reminder im aktuellen Chat")]

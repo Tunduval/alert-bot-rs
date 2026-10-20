@@ -220,13 +220,14 @@ impl PgStore {
 
 impl PgStore {
     pub async fn create_alert(&self, new: NewAlert) -> Result<Alert> {
+        let group_admin_cancellable = new.scope == AlertScope::Private && new.chat_type.is_group();
         let row = sqlx::query(
             r#"
             INSERT INTO alerts (
                 user_id, chat_id, chat_type, scope, text, fire_at,
-                dtstart, rrule, tz
+                dtstart, rrule, tz, group_admin_cancellable
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
                       dtstart, rrule, tz,
                       state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
@@ -241,6 +242,7 @@ impl PgStore {
         .bind(new.schedule.dtstart)
         .bind(new.schedule.rrule.as_deref())
         .bind(new.schedule.tz.name())
+        .bind(group_admin_cancellable)
         .fetch_one(&self.pool)
         .await?;
 
@@ -257,6 +259,7 @@ impl PgStore {
         new: NewAlert,
         limits: AlertLimits,
     ) -> Result<CreateAlertOutcome> {
+        let group_admin_cancellable = new.scope == AlertScope::Private && new.chat_type.is_group();
         let mut tx = self.pool.begin().await?;
         lock_alert_quota_keys(&mut tx, new.user_id, new.chat_id).await?;
 
@@ -305,9 +308,9 @@ impl PgStore {
             r#"
             INSERT INTO alerts (
                 user_id, chat_id, chat_type, scope, text, fire_at,
-                dtstart, rrule, tz
+                dtstart, rrule, tz, group_admin_cancellable
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
                       dtstart, rrule, tz,
                       state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
@@ -322,6 +325,7 @@ impl PgStore {
         .bind(new.schedule.dtstart)
         .bind(new.schedule.rrule.as_deref())
         .bind(new.schedule.tz.name())
+        .bind(group_admin_cancellable)
         .fetch_one(&mut *tx)
         .await?;
         let alert = row_to_alert(row)?;
@@ -456,9 +460,10 @@ impl PgStore {
             r#"
             INSERT INTO alerts (
                 user_id, chat_id, chat_type, scope, text, fire_at,
-                dtstart, rrule, tz, snooze_source_alert_id, snooze_source_generation
+                dtstart, rrule, tz, snooze_source_alert_id, snooze_source_generation,
+                group_admin_cancellable
             )
-            VALUES ($1, $2, $3, 'private', $4, $5, $5, NULL, $6, $7, $8)
+            VALUES ($1, $2, $3, 'private', $4, $5, $5, NULL, $6, $7, $8, FALSE)
             RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
                       dtstart, rrule, tz,
                       state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
@@ -541,7 +546,8 @@ impl PgStore {
     ) -> Result<CancelAlertOutcome> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT user_id, chat_id, chat_type, scope, state, snooze_source_alert_id
+            "SELECT user_id, chat_id, chat_type, scope, state, snooze_source_alert_id,
+                    group_admin_cancellable
              FROM alerts WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -562,6 +568,7 @@ impl PgStore {
         let state = AlertState::parse(&state_value)
             .ok_or_else(|| StorageError::InvalidEnum(state_value.clone()))?;
         let snooze_source_alert_id: Option<i64> = row.try_get("snooze_source_alert_id")?;
+        let group_admin_cancellable: bool = row.try_get("group_admin_cancellable")?;
         if chat_id != origin_chat_id || &chat_type != origin_chat_type {
             return Ok(CancelAlertOutcome::NotCancellable);
         }
@@ -570,6 +577,7 @@ impl PgStore {
                 user_id == requester_user_id
                     || (allow_group_admin_override
                         && chat_type.is_group()
+                        && group_admin_cancellable
                         && snooze_source_alert_id.is_none())
             }
             AlertScope::Shared => true,
@@ -1119,9 +1127,55 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn limited_private_group_one_shot_is_admin_cancellable(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::De).await.unwrap();
+        let at = Utc::now() + chrono::Duration::hours(1);
+        let alert = match store
+            .create_alert_with_limits(
+                NewAlert {
+                    user_id: 42,
+                    chat_id: -100,
+                    chat_type: ChatType::Group,
+                    scope: AlertScope::Private,
+                    text: "limited admin cleanup".into(),
+                    fire_at: at,
+                    schedule: Schedule::one_shot(at, chrono_tz::UTC),
+                },
+                AlertLimits {
+                    max_per_user: 100,
+                    max_per_chat: 50,
+                    max_per_user_chat: 10,
+                },
+            )
+            .await
+            .unwrap()
+        {
+            CreateAlertOutcome::Created(alert) => alert,
+            outcome => panic!("expected alert creation, got {outcome:?}"),
+        };
+
+        assert_eq!(
+            store
+                .cancel_alert(alert.id, 7, -100, &ChatType::Group, true)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::Cancelled
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
     async fn group_admin_override_is_bound_to_stored_chat(pool: PgPool) {
         let store = PgStore { pool };
         let alert = private_group_alert(&store, "admin cleanup", false).await;
+        let group_admin_cancellable: bool =
+            sqlx::query_scalar("SELECT group_admin_cancellable FROM alerts WHERE id = $1")
+                .bind(alert.id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(group_admin_cancellable);
 
         for (chat_id, chat_type, admin_override) in [
             (-200, ChatType::Group, true),
@@ -1190,6 +1244,102 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn migration_backfills_only_unambiguous_private_group_series(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::De).await.unwrap();
+        sqlx::query("ALTER TABLE alerts DROP COLUMN group_admin_cancellable")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 8")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let at = Utc::now() + chrono::Duration::hours(1);
+        let recurring_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO alerts (
+                user_id, chat_id, chat_type, scope, text, fire_at,
+                dtstart, rrule, tz
+            )
+            VALUES (42, -100, 'group', 'private', 'legacy series', $1,
+                    $1, 'FREQ=HOURLY', 'UTC')
+            RETURNING id
+            "#,
+        )
+        .bind(at)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let one_shot_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO alerts (
+                user_id, chat_id, chat_type, scope, text, fire_at,
+                dtstart, rrule, tz
+            )
+            VALUES (42, -100, 'group', 'private', 'ambiguous legacy one-shot', $1,
+                    $1, NULL, 'UTC')
+            RETURNING id
+            "#,
+        )
+        .bind(at)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+
+        store.migrate().await.unwrap();
+        let provenance: Vec<(i64, bool)> = sqlx::query_as(
+            "SELECT id, group_admin_cancellable FROM alerts WHERE id IN ($1, $2) ORDER BY id",
+        )
+        .bind(recurring_id)
+        .bind(one_shot_id)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(provenance, vec![(recurring_id, true), (one_shot_id, false)]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn ambiguous_legacy_private_group_one_shot_remains_owner_controlled(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::De).await.unwrap();
+        let at = Utc::now() + chrono::Duration::hours(1);
+        let alert_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO alerts (
+                user_id, chat_id, chat_type, scope, text, fire_at,
+                dtstart, rrule, tz, group_admin_cancellable
+            )
+            VALUES (42, -100, 'group', 'private', 'ambiguous legacy one-shot', $1,
+                    $1, NULL, 'UTC', FALSE)
+            RETURNING id
+            "#,
+        )
+        .bind(at)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store
+                .cancel_alert(alert_id, 7, -100, &ChatType::Group, true)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::NotCancellable
+        );
+        assert_eq!(
+            store
+                .cancel_alert(alert_id, 42, -100, &ChatType::Group, false)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::Cancelled
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
     async fn group_admin_override_from_commands_or_callbacks_cannot_cancel_snoozes(pool: PgPool) {
         let store = PgStore { pool };
         private_group_alert(&store, "private snooze", true).await;
@@ -1218,6 +1368,13 @@ mod tests {
             CreateSnoozeOutcome::Created(alert) => alert,
             outcome => panic!("expected snooze creation, got {outcome:?}"),
         };
+        let group_admin_cancellable: bool =
+            sqlx::query_scalar("SELECT group_admin_cancellable FROM alerts WHERE id = $1")
+                .bind(snooze.id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(!group_admin_cancellable);
 
         // Both /cancel and forged cancel/stop callbacks reach this boundary
         // with the same override flag after the Telegram administrator check.

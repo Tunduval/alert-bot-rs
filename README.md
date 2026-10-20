@@ -48,16 +48,20 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
     visible group administrator can cancel them.
   - Recurring group reminders must use `/galert`. This prevents a member from
     leaving an unmanageable private series behind.
-  - `/galert` is a shared group reminder; anyone in the chat can cancel.
+  - `/galert` is a shared group reminder; any current member can cancel.
   - Group administrators can also remove legacy private series left by former
     members. Failed administrator checks deny the cancellation.
-  - The bot must be a group administrator to verify shared-reminder callback
-    users reliably with Telegram's `getChatMember` API. Failed checks deny the
-    cancellation and leave the reminder unchanged.
+  - The bot must be a group administrator before it creates any group reminder.
+    This lets it verify members and visible administrators reliably with
+    Telegram's APIs. Failed checks deny creation or cancellation and leave
+    existing reminders unchanged. Cancel group reminders before demoting the
+    bot.
   - Commands sent as an anonymous administrator or on behalf of a chat are
     ignored because Telegram does not provide a trustworthy user identity.
 - **Delivery controls** — snooze by 5 minutes, 15 minutes or 1 hour; stop a
-  recurring series directly from its delivered message.
+  recurring series directly from its delivered message. Private snoozes stay
+  owner-only, including in groups; the group-administrator override does not
+  apply to them.
 - **Per-user language and timezone** — auto-detected from Telegram's
   `language_code`, overridable via `/lang` and `/tz`. The slash-menu also
   switches to the right language when `/lang` is used in a DM.
@@ -185,8 +189,9 @@ sudo -u postgres psql --dbname alertbot --command \
 # lock functions it uses for migrations and quota serialization.
 sudo -u postgres psql -v ON_ERROR_STOP=1 --dbname alertbot <<'SQL'
 ALTER ROLE alertbot CONNECTION LIMIT 12;
+ALTER DATABASE alertbot OWNER TO alertbot;
 REVOKE CONNECT, TEMPORARY ON DATABASE alertbot FROM PUBLIC;
-GRANT CONNECT ON DATABASE alertbot TO alertbot;
+GRANT CONNECT, TEMPORARY ON DATABASE alertbot TO alertbot;
 
 REVOKE EXECUTE ON FUNCTION
     pg_catalog.pg_advisory_lock(bigint),
@@ -230,15 +235,23 @@ sudo -u postgres psql --dbname alertbot --command \
   "SELECT rolname FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND pg_has_role(rolname, 'pg_use_reserved_connections', 'member');"
 ```
 
-Put these rules before the generic `local all all peer` rule in
-`/etc/postgresql/<major>/main/pg_hba.conf`. They let both service identities
-enter only the application database and reject every other database in the
-cluster:
+Put these rules before every generic `local` or `host` rule in
+`/etc/postgresql/<major>/main/pg_hba.conf`. PostgreSQL uses the first matching
+rule. The local rules let both service identities enter only the application
+database. The host rules reject IPv4 and IPv6 TCP connections before a later
+password rule could accept them:
 
 ```text
 local   alertbot   alertbot,alertbot-backup   peer
 local   all        alertbot,alertbot-backup   reject
+host    all        alertbot,alertbot-backup   0.0.0.0/0   reject
+host    all        alertbot,alertbot-backup   ::0/0       reject
 ```
+
+Do not add another `local` or `host` rule for these roles. A PostgreSQL login
+role can set its own password. The explicit host rejects therefore remain
+required even though this deployment neither sets nor stores database
+passwords. A later generic password rule must not become an alternative path.
 
 Reload PostgreSQL after editing the file, then verify the boundary:
 
@@ -248,15 +261,25 @@ sudo -u postgres psql --dbname alertbot --command 'SELECT pg_reload_conf();'
 # PostgreSQL accepted every HBA rule.
 sudo -u postgres psql --dbname alertbot --command \
   'SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL;'
+# Review the complete effective order. The four service-role rules above must
+# appear before every generic local or host rule.
+sudo -u postgres psql --dbname alertbot --command \
+  'SELECT line_number, type, database, user_name, address, auth_method FROM pg_hba_file_rules ORDER BY line_number;'
 
 # Peer-authentication sanity check — must succeed and print a row count.
 sudo -u alertbot psql -d alertbot -c "SELECT count(*) FROM pg_tables WHERE schemaname='public';"
 # The HBA isolation check must fail.
 ! sudo -u alertbot psql -d postgres -c 'SELECT 1;'
+# Both TCP checks must fail with "pg_hba.conf rejects connection", not a
+# password prompt. Test both address families when PostgreSQL listens on them.
+! sudo -u alertbot psql "hostaddr=127.0.0.1 dbname=alertbot user=alertbot connect_timeout=2" -c 'SELECT 1;'
+! sudo -u alertbot psql "hostaddr=::1 dbname=alertbot user=alertbot connect_timeout=2" -c 'SELECT 1;'
 ```
 
-No password is stored anywhere — peer auth via the Unix socket binds
-identity to the calling system user.
+The app role owns the application database and keeps `TEMPORARY` plus only the
+three advisory-lock functions listed above. The backup role receives only the
+separate read grants in step 8. Peer authentication via the Unix socket binds
+each database identity to its matching system user without a stored password.
 
 #### 3. Install the systemd unit + config file
 
@@ -590,6 +613,12 @@ sudo -u alertbot-backup psql -v ON_ERROR_STOP=1 --dbname alertbot \
 # The backup identity must not reach another database or write persistent
 # large objects, temporary tables, or advisory locks. Every check must fail.
 ! sudo -u alertbot-backup psql --dbname postgres --command 'SELECT 1;'
+! sudo -u alertbot-backup psql \
+  "hostaddr=127.0.0.1 dbname=alertbot user=alertbot-backup connect_timeout=2" \
+  --command 'SELECT 1;'
+! sudo -u alertbot-backup psql \
+  "hostaddr=::1 dbname=alertbot user=alertbot-backup connect_timeout=2" \
+  --command 'SELECT 1;'
 ! sudo -u alertbot-backup psql --dbname alertbot --command 'SELECT lo_create(0);'
 ! sudo -u alertbot-backup psql --dbname alertbot \
   --command 'CREATE TEMPORARY TABLE privilege_probe(value integer);'
