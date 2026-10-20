@@ -1,0 +1,28 @@
+name: CI environment-file canary
+
+on:
+  push:
+    branches: [security/ci-env-canary]
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Run an untrusted Cargo build script
+        run: cargo build --manifest-path .github/ci-env-canary/Cargo.toml
+
+      - name: Enter a later fake-secret step
+        env:
+          FAKE_LXC_SSH_KEY: fake-lxc-key-marker
+          FAKE_CF_SECRET: fake-cloudflare-secret-marker
+        run: |
+          result="$RUNNER_TEMP/ci-env-canary-result.txt"
+          grep -Fxq 'next_step_hook=executed' "$result"
+          grep -Fxq 'lxc_ssh_key=reachable' "$result"
+          grep -Fxq 'cloudflare_secret=reachable' "$result"
+          echo 'CANARY_CONFIRMED: build.rs reached both fake markers in the later step'
