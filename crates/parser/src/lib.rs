@@ -191,6 +191,13 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc)
     }
+    fn parse_at(input: &str, now_utc: DateTime<Utc>) -> Result<Parsed, ParseError> {
+        let ctx = ParseContext {
+            now_utc,
+            ..ctx(Language::De)
+        };
+        parse(input, &ctx)
+    }
 
     // ---- Relative simple ----
 
@@ -320,6 +327,32 @@ mod tests {
     }
 
     #[test]
+    fn rel_subday_followed_by_number_keeps_number_as_text() {
+        let now = ctx(Language::De).now_utc;
+        for (input, offset, text) in [
+            (
+                "30m 2 Eier kochen",
+                chrono::Duration::minutes(30),
+                "2 Eier kochen",
+            ),
+            (
+                "1h 3 Mails beantworten",
+                chrono::Duration::hours(1),
+                "3 Mails beantworten",
+            ),
+            (
+                "in 10 minuten 4 Tabletten",
+                chrono::Duration::minutes(10),
+                "4 Tabletten",
+            ),
+        ] {
+            let r = p(input);
+            assert_eq!(r.text, text, "{input}");
+            assert_eq!(r.fire_at(), now + offset, "{input}");
+        }
+    }
+
+    #[test]
     fn rel_50_year_cap() {
         let e = err("100Y text");
         assert_eq!(e, ParseError::RelTooFar(MAX_RELATIVE_YEARS));
@@ -351,6 +384,16 @@ mod tests {
     fn abs_trailing_dot() {
         let r = p("30.4. Termin");
         assert_eq!(r.fire_at(), local(2027, 4, 30, 9, 0)); // past this year → next
+    }
+
+    #[test]
+    fn abs_no_year_today_with_time_passed_rolls_to_next_year() {
+        // Reference 2026-05-08 12:00: today's 09:00 default and an explicit
+        // 11:00 are past, so the next occurrence is next year.
+        assert_eq!(p("8.5 Termin").fire_at(), local(2027, 5, 8, 9, 0));
+        assert_eq!(p("8.5. 11:00 Termin").fire_at(), local(2027, 5, 8, 11, 0));
+        // Still ahead today → stays this year.
+        assert_eq!(p("8.5 15:00 Termin").fire_at(), local(2026, 5, 8, 15, 0));
     }
 
     #[test]
@@ -459,6 +502,14 @@ mod tests {
     fn named_weekday_default_time_passed_next_week() {
         let r = p("fr putzen");
         assert_eq!(r.fire_at(), local(2026, 5, 15, 9, 0));
+    }
+
+    #[test]
+    fn named_weekday_in_dst_gap_keeps_weekday_and_bumps_time() {
+        // Europe/Berlin springs forward on Sunday 2027-03-28: 02:30 does not
+        // exist. Sent on the Saturday before, `so 2:30` must stay on Sunday.
+        let r = parse_at("so 2:30 x", local(2027, 3, 27, 12, 0)).unwrap();
+        assert_eq!(r.fire_at(), local(2027, 3, 28, 3, 30));
     }
 
     #[test]
@@ -674,6 +725,33 @@ mod tests {
         // `*30m 11:00` — an interval that also wants a fixed clock is
         // contradictory, same as one-shot relative.
         assert_eq!(err("*30m 11:00 wasser"), ParseError::SubDayRelWithOverride);
+    }
+
+    #[test]
+    fn rec_subday_followed_by_number_keeps_number_as_text() {
+        let r = p("*30m 2 Gläser Wasser");
+        assert_eq!(r.text, "2 Gläser Wasser");
+        assert!(rrule(&r).contains("FREQ=MINUTELY"));
+    }
+
+    #[test]
+    fn rec_subday_interval_is_exact_across_dst() {
+        // Europe/Berlin springs forward at 2027-03-28 01:00 UTC. Sub-day
+        // intervals must stay exactly N apart on the UTC timeline.
+        for (input, step) in [
+            ("*3h x", chrono::Duration::hours(3)),
+            ("*30m x", chrono::Duration::minutes(30)),
+        ] {
+            let now = local(2027, 3, 27, 22, 0);
+            let r = parse_at(input, now).unwrap();
+            let mut prev = r.fire_at();
+            assert_eq!(prev, now + step, "{input}");
+            for _ in 0..8 {
+                let next = r.schedule.next_after(prev).unwrap();
+                assert_eq!(next - prev, step, "{input}: {prev} -> {next}");
+                prev = next;
+            }
+        }
     }
 
     #[test]

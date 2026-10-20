@@ -127,6 +127,8 @@ pub fn format_recurrence_short(schedule: &Schedule, lang: Language) -> Option<St
         Frequency::Monthly => {
             let day = rule.get_by_month_day().first().copied().unwrap_or(1);
             match (interval, lang) {
+                (1, Language::De) if day < 0 => format!("jeden letzten Tag {hm}"),
+                (1, Language::En) if day < 0 => format!("monthly on the last day {hm}"),
                 (1, Language::De) => format!("jeden {day}. {hm}"),
                 (1, Language::En) => format!("monthly on {day}. {hm}"),
                 (n, Language::De) => format!("alle {n} Monate, {day}. {hm}"),
@@ -137,10 +139,26 @@ pub fn format_recurrence_short(schedule: &Schedule, lang: Language) -> Option<St
             let month = rule.get_by_month().first().copied().unwrap_or(1);
             let day = rule.get_by_month_day().first().copied().unwrap_or(1);
             match (interval, lang) {
+                (1, Language::De) if day < 0 => format!(
+                    "jährlich am letzten Tag im {} {hm}",
+                    month_name_short(month as u32, lang)
+                ),
+                (1, Language::En) if day < 0 => format!(
+                    "yearly on the last day of {} {hm}",
+                    month_name_short(month as u32, lang)
+                ),
                 (1, Language::De) => format!("jährlich {day}.{month}. {hm}"),
                 (1, Language::En) => {
                     format!("yearly {day} {} {hm}", month_name_short(month as u32, lang))
                 }
+                (n, Language::De) if day < 0 => format!(
+                    "alle {n} Jahre am letzten Tag im {} {hm}",
+                    month_name_short(month as u32, lang)
+                ),
+                (n, Language::En) if day < 0 => format!(
+                    "every {n} years on the last day of {} {hm}",
+                    month_name_short(month as u32, lang)
+                ),
                 (n, Language::De) => format!("alle {n} Jahre, {day}.{month}. {hm}"),
                 (n, Language::En) => format!(
                     "every {n} years on {day} {} {hm}",
@@ -192,3 +210,61 @@ fn month_name_short(m: u32, lang: Language) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{NaiveTime, TimeZone};
+
+    fn anchor() -> (DateTime<Utc>, Tz, NaiveTime) {
+        let tz: Tz = "Europe/Berlin".parse().unwrap();
+        let dtstart = tz.with_ymd_and_hms(2026, 5, 31, 9, 0, 0).unwrap();
+        (
+            dtstart.with_timezone(&Utc),
+            tz,
+            NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        )
+    }
+
+    #[test]
+    fn monthly_last_day_renders_as_last_day() {
+        let (dtstart, tz, time) = anchor();
+        let s = Schedule::monthly_last_day(dtstart, tz, time).unwrap();
+        assert_eq!(
+            format_recurrence_short(&s, Language::De).as_deref(),
+            Some("jeden letzten Tag 09:00")
+        );
+        assert_eq!(
+            format_recurrence_short(&s, Language::En).as_deref(),
+            Some("monthly on the last day 09:00")
+        );
+    }
+
+    #[test]
+    fn yearly_last_day_of_february_renders_as_last_day() {
+        let (dtstart, tz, time) = anchor();
+        let s = Schedule::yearly_last_day_of_month(dtstart, tz, 2, time).unwrap();
+        assert_eq!(
+            format_recurrence_short(&s, Language::De).as_deref(),
+            Some("jährlich am letzten Tag im Feb 09:00")
+        );
+        assert_eq!(
+            format_recurrence_short(&s, Language::En).as_deref(),
+            Some("yearly on the last day of Feb 09:00")
+        );
+    }
+
+    #[test]
+    fn yearly_interval_last_day_renders_as_last_day() {
+        let (dtstart, tz, _) = anchor();
+        let rule = "FREQ=YEARLY;INTERVAL=2;BYMONTH=2;BYMONTHDAY=-1;BYHOUR=9;BYMINUTE=0";
+        let s = Schedule::from_db(dtstart, tz, Some(rule)).unwrap();
+        assert_eq!(
+            format_recurrence_short(&s, Language::De).as_deref(),
+            Some("alle 2 Jahre am letzten Tag im Feb 09:00")
+        );
+        assert_eq!(
+            format_recurrence_short(&s, Language::En).as_deref(),
+            Some("every 2 years on the last day of Feb 09:00")
+        );
+    }
+}

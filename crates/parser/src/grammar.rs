@@ -118,17 +118,17 @@ fn try_one_shot_strategies(
     // 1. Relative (compact, inline-longform, or two-token longform).
     if let Some((spec, end_idx, default_end)) = try_relative_match(tokens)? {
         let (override_time, end_offset) =
-            consume_optional_time(tokens, end_idx).unwrap_or((None, default_end));
+            consume_time_after_spec(tokens, end_idx, &spec).unwrap_or((None, default_end));
         let (fire_at, notes) = spec.apply(ctx.now_utc, ctx.tz, override_time)?;
         return Ok((fire_at, end_offset, notes));
     }
 
     // 2. Absolute date.
     if let Some(first) = tokens.first().copied() {
-        if let Some(date) = parse_date_token(first.0, ctx) {
-            let (override_time, end_offset) =
-                consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
-            let time = override_time.unwrap_or(DEFAULT_TIME);
+        let (override_time, end_offset) =
+            consume_optional_time(tokens, 1).unwrap_or((None, token_end(first)));
+        let time = override_time.unwrap_or(DEFAULT_TIME);
+        if let Some(date) = parse_date_token(first.0, time, ctx) {
             let fire_at = local_to_utc(date, time, ctx.tz)?;
             return Ok((fire_at, end_offset, Vec::new()));
         }
@@ -453,11 +453,11 @@ fn split_leading_digits(s: &str) -> Option<(i64, &str)> {
 // Absolute date: DD.MM[.YY|.YYYY|.] and ISO YYYY-MM-DD.
 // ---------------------------------------------------------------------------
 
-fn parse_date_token(s: &str, ctx: &ParseContext) -> Option<NaiveDate> {
+fn parse_date_token(s: &str, time: NaiveTime, ctx: &ParseContext) -> Option<NaiveDate> {
     if let Some(d) = parse_iso_date(s) {
         return Some(d);
     }
-    parse_dotted_date(s, ctx)
+    parse_dotted_date(s, time, ctx)
 }
 
 fn parse_iso_date(s: &str) -> Option<NaiveDate> {
@@ -480,7 +480,7 @@ fn parse_iso_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt(y, m, d)
 }
 
-fn parse_dotted_date(s: &str, ctx: &ParseContext) -> Option<NaiveDate> {
+fn parse_dotted_date(s: &str, time: NaiveTime, ctx: &ParseContext) -> Option<NaiveDate> {
     let s = s.strip_suffix('.').unwrap_or(s);
     let parts: Vec<&str> = s.split('.').collect();
     if !(parts.len() == 2 || parts.len() == 3) {
@@ -505,7 +505,7 @@ fn parse_dotted_date(s: &str, ctx: &ParseContext) -> Option<NaiveDate> {
     } else {
         let current = now_local.year();
         match NaiveDate::from_ymd_opt(current, month, day) {
-            Some(d) if d >= now_local.date_naive() => current,
+            Some(d) if local_to_utc(d, time, ctx.tz).is_ok_and(|at| at > ctx.now_utc) => current,
             _ => current + 1,
         }
     };
@@ -555,6 +555,24 @@ fn consume_optional_time(
         }
     }
     Some((Some(time), end_offset))
+}
+
+/// Like `consume_optional_time`, but after a sub-day spec a bare number
+/// (`30m 2 Eier`) is reminder text, not an override. Explicit clocks (`11:00`,
+/// `9 Uhr`, `2pm`) are still consumed so that they get rejected.
+fn consume_time_after_spec(
+    tokens: &[Token<'_>],
+    from: usize,
+    spec: &RelSpec,
+) -> Option<(Option<NaiveTime>, usize)> {
+    let found = consume_optional_time(tokens, from)?;
+    let bare_number = tokens
+        .get(from)
+        .is_some_and(|t| t.0.bytes().all(|b| b.is_ascii_digit()) && token_end(*t) == found.1);
+    if spec.has_sub_day() && bare_number {
+        return None;
+    }
+    Some(found)
 }
 
 /// Accepts `14:30`, `14`, `2pm`, `2:30pm`, `12am`, `12pm`. Case-insensitive
@@ -637,23 +655,14 @@ fn first_future_weekday(
     time: NaiveTime,
     ctx: &ParseContext,
 ) -> NaiveDate {
-    use chrono::TimeZone;
-    for offset in 0..=7 {
-        let candidate = today + Duration::days(offset);
-        if candidate.weekday() != target {
-            continue;
-        }
-        let candidate_local = candidate.and_time(time);
-        let candidate_utc = match ctx.tz.from_local_datetime(&candidate_local) {
-            chrono::LocalResult::Single(dt) => dt.with_timezone(&Utc),
-            chrono::LocalResult::Ambiguous(earlier, _) => earlier.with_timezone(&Utc),
-            chrono::LocalResult::None => continue,
-        };
-        if candidate_utc > ctx.now_utc {
-            return candidate;
-        }
+    let days_ahead =
+        (target.num_days_from_monday() + 7 - today.weekday().num_days_from_monday()) % 7;
+    let first = today + Duration::days(days_ahead as i64);
+    if local_to_utc(first, time, ctx.tz).is_ok_and(|at| at > ctx.now_utc) {
+        first
+    } else {
+        first + Duration::days(7)
     }
-    today + Duration::days(7)
 }
 
 // ===========================================================================
@@ -721,7 +730,7 @@ fn try_recurring_relative(
     // `*3M 18:00`, `*1Y 9:00`, `alle 2d 11:00`). Consume it here so the time
     // token doesn't leak into the reminder text, and so the schedule fires at
     // the requested wall-clock time instead of the creation time.
-    let (override_time, end_offset) = match consume_optional_time(tokens, end_idx) {
+    let (override_time, end_offset) = match consume_time_after_spec(tokens, end_idx, &spec) {
         Some((Some(t), off)) => (Some(t), off),
         _ => (None, spec_end_offset),
     };
@@ -796,7 +805,9 @@ fn try_recurring_relative(
         let dtstart = ctx.now_utc
             .checked_add_signed(Duration::seconds(total_secs))
             .ok_or(ParseError::InvalidRecurrenceSpec)?;
-        Schedule::interval_seconds(dtstart, ctx.tz, total_secs)?
+        // The schedule zone is UTC: hourly/minutely RRULEs iterate in the
+        // schedule's zone, so a local zone would drift across DST changes.
+        Schedule::interval_seconds(dtstart, chrono_tz::UTC, total_secs)?
     };
     Ok(Some((schedule, end_offset, None)))
 }
