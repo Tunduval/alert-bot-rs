@@ -32,10 +32,12 @@ pub const MAX_ALERTS_PER_CHAT: i64 = 50;
 const COMMANDS_PER_MINUTE: u32 = 6;
 
 /// Commands accepted across all Telegram users per minute after their
-/// individual check passed. This caps persistent work after a webhook-secret
-/// compromise without letting one exhausted user consume everyone else's
-/// budget.
-const GLOBAL_COMMANDS_PER_MINUTE: u32 = 120;
+/// individual check passed. Forged webhook updates can choose any user and
+/// chat ID, so the per-user and per-chat quotas alone would not bound
+/// persistent work after a webhook-secret compromise. The ceiling sits far
+/// above real traffic, so a group of real accounts at their individual limit
+/// cannot lock everyone else out.
+const GLOBAL_COMMANDS_PER_MINUTE: u32 = 3_000;
 
 /// Maximum user identities retained by the in-memory limiter. A forged
 /// webhook update cannot allocate state beyond this fixed ceiling.
@@ -215,19 +217,25 @@ mod tests {
     #[test]
     fn fresh_identities_share_a_bounded_persistent_work_budget() {
         let l = CommandRateLimiter::new();
+        // A fixed instant keeps the global bucket from refilling mid-loop.
+        let now = Instant::now();
         for user_id in 0..GLOBAL_COMMANDS_PER_MINUTE {
-            assert!(l.check(i64::from(user_id)), "global burst within quota");
+            assert!(
+                l.check_at(i64::from(user_id), now),
+                "global burst within quota"
+            );
         }
-        assert!(!l.check(i64::from(GLOBAL_COMMANDS_PER_MINUTE)));
+        assert!(!l.check_at(i64::from(GLOBAL_COMMANDS_PER_MINUTE), now));
     }
 
     #[test]
     fn globally_rejected_users_keep_their_bucket_tracking() {
         let limiter = CommandRateLimiter::new();
+        let now = Instant::now();
         for user_id in 0..GLOBAL_COMMANDS_PER_MINUTE {
-            assert!(limiter.check(i64::from(user_id)));
+            assert!(limiter.check_at(i64::from(user_id), now));
         }
-        let expired = Instant::now() - TRACKED_USER_TTL - Duration::from_secs(1);
+        let expired = now - TRACKED_USER_TTL - Duration::from_secs(1);
         limiter
             .state
             .lock()
@@ -236,13 +244,13 @@ mod tests {
             .get_mut(&0)
             .unwrap()
             .last_seen = expired;
-        assert!(!limiter.check(0));
+        assert!(!limiter.check_at(0, now));
         assert!(
             limiter.state.lock().unwrap().users[&0].last_seen > expired,
             "a rejected access must retain its tracking entry"
         );
         for user_id in GLOBAL_COMMANDS_PER_MINUTE..MAX_TRACKED_USERS as u32 * 2 {
-            let _ = limiter.check(i64::from(user_id));
+            let _ = limiter.check_at(i64::from(user_id), now);
         }
         assert_eq!(limiter.state.lock().unwrap().users.len(), MAX_TRACKED_USERS);
     }
