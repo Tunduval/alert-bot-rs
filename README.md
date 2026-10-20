@@ -44,8 +44,13 @@ Bot:   ✓ #3 · Fr 30.4.2027 09:00
   with adaptive thresholds. `heute`/`today` is intentionally rejected with
   a hint to use bare clock-time instead.
 - **Group reminders with two scopes**
-  - `/alert` in a group fires in the group, but only the creator can cancel it.
+  - `/alert` creates private one-shot reminders in a group. The creator or a
+    visible group administrator can cancel them.
+  - Recurring group reminders must use `/galert`. This prevents a member from
+    leaving an unmanageable private series behind.
   - `/galert` is a shared group reminder; anyone in the chat can cancel.
+  - Group administrators can also remove legacy private series left by former
+    members. Failed administrator checks deny the cancellation.
   - The bot must be a group administrator to verify shared-reminder callback
     users reliably with Telegram's `getChatMember` API. Failed checks deny the
     cancellation and leave the reminder unchanged.

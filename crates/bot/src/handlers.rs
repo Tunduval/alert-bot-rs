@@ -128,6 +128,14 @@ async fn create_alert(
         return Ok(());
     }
     let chat_type = chat_type_from_msg(msg);
+    if rejects_private_group_recurrence(scope, &chat_type, parsed.schedule.is_recurring()) {
+        bot.send_message(
+            msg.chat.id,
+            m::private_group_recurrence_rejected(user.language),
+        )
+        .await?;
+        return Ok(());
+    }
     let new = NewAlert {
         user_id: user.telegram_id,
         chat_id: msg.chat.id.0,
@@ -184,6 +192,14 @@ async fn create_alert(
         .reply_markup(action_keyboard(user.language, alert.id))
         .await?;
     Ok(())
+}
+
+fn rejects_private_group_recurrence(
+    scope: AlertScope,
+    chat_type: &ChatType,
+    is_recurring: bool,
+) -> bool {
+    scope == AlertScope::Private && chat_type.is_group() && is_recurring
 }
 
 fn action_keyboard(lang: Language, id: i64) -> InlineKeyboardMarkup {
@@ -304,18 +320,48 @@ async fn cancel(
             .await?;
         return Ok(());
     };
-    if alert.chat_id != msg.chat.id.0 {
+    let origin_chat_type = chat_type_from_msg(msg);
+    if !alert_has_origin(&alert, msg.chat.id.0, &origin_chat_type) {
         // Don't reveal alerts from other chats.
         bot.send_message(msg.chat.id, m::cancel_not_found(lang))
             .await?;
         return Ok(());
     }
-    if !alert.can_edit(requester) {
-        bot.send_message(msg.chat.id, m::cancel_not_allowed(lang))
-            .await?;
-        return Ok(());
-    }
-    let reply = match store.cancel_alert(id, requester).await? {
+    let admin_override = match alert.scope {
+        AlertScope::Shared => false,
+        AlertScope::Private => match private_cancel_authority(
+            bot,
+            &alert,
+            msg.chat.id.0,
+            &origin_chat_type,
+            requester,
+        )
+        .await
+        {
+            PrivateCancelAuthority::Owner => false,
+            PrivateCancelAuthority::GroupAdmin => true,
+            PrivateCancelAuthority::Denied => {
+                bot.send_message(msg.chat.id, m::cancel_not_allowed(lang))
+                    .await?;
+                return Ok(());
+            }
+            PrivateCancelAuthority::Unavailable => {
+                bot.send_message(msg.chat.id, m::group_admin_check_failed(lang))
+                    .await?;
+                return Ok(());
+            }
+        },
+    };
+    let reply = match store
+        .cancel_alert(
+            id,
+            requester,
+            msg.chat.id.0,
+            &origin_chat_type,
+            admin_override,
+        )
+        .await?
+    {
         CancelAlertOutcome::Cancelled => m::cancel_ok(lang, id),
         CancelAlertOutcome::DeliveryStarted => m::cancel_delivery_started(lang).to_string(),
         CancelAlertOutcome::NotCancellable => m::cancel_not_found(lang).to_string(),
@@ -462,7 +508,8 @@ async fn callback_alert_in_origin_chat(
     let Some(msg) = query.message.as_ref() else {
         return Ok(None);
     };
-    if msg.chat().id.0 != alert.chat_id {
+    let origin_chat_type = chat_type_from_chat(msg.chat());
+    if !alert_has_origin(&alert, msg.chat().id.0, &origin_chat_type) {
         return Ok(None);
     }
     Ok(Some(alert))
@@ -473,6 +520,59 @@ enum SharedMembership {
     Current,
     NotCurrent,
     Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateCancelAuthority {
+    Owner,
+    GroupAdmin,
+    Denied,
+    Unavailable,
+}
+
+fn alert_has_origin(alert: &botcore::Alert, chat_id: i64, chat_type: &ChatType) -> bool {
+    alert.chat_id == chat_id && &alert.chat_type == chat_type
+}
+
+/// Resolve authority for a private cancellation. The exact origin check comes
+/// first so a forged callback can never trigger a Telegram lookup for another
+/// chat. Owners need no network lookup. Only visible users returned by
+/// `getChatAdministrators` may override ownership in a group or supergroup.
+async fn private_cancel_authority(
+    bot: &Bot,
+    alert: &botcore::Alert,
+    origin_chat_id: i64,
+    origin_chat_type: &ChatType,
+    requester_user_id: i64,
+) -> PrivateCancelAuthority {
+    if alert.scope != AlertScope::Private
+        || !alert_has_origin(alert, origin_chat_id, origin_chat_type)
+    {
+        return PrivateCancelAuthority::Denied;
+    }
+    if alert.user_id == requester_user_id {
+        return PrivateCancelAuthority::Owner;
+    }
+    if !alert.chat_type.is_group() {
+        return PrivateCancelAuthority::Denied;
+    }
+
+    match bot.get_chat_administrators(ChatId(alert.chat_id)).await {
+        Ok(admins)
+            if admins.iter().any(|member| {
+                identity::user_id(member.user.id.0) == Some(requester_user_id)
+            }) => PrivateCancelAuthority::GroupAdmin,
+        Ok(_) => PrivateCancelAuthority::Denied,
+        Err(error) => {
+            tracing::warn!(
+                chat_id = alert.chat_id,
+                requester = requester_user_id,
+                error = ?error,
+                "group administrator check failed"
+            );
+            PrivateCancelAuthority::Unavailable
+        }
+    }
 }
 
 /// Verify shared-alert authority against Telegram immediately before mutation.
@@ -516,6 +616,44 @@ async fn shared_callback_mutation_allowed(
     Ok(false)
 }
 
+async fn callback_cancel_admin_override(
+    bot: &Bot,
+    query: &CallbackQuery,
+    alert: &botcore::Alert,
+    requester: i64,
+    lang: Language,
+) -> Result<Option<bool>, teloxide::RequestError> {
+    if alert.scope == AlertScope::Shared {
+        return shared_callback_mutation_allowed(bot, query, alert, lang)
+            .await
+            .map(|allowed| allowed.then_some(false));
+    }
+
+    let Some(message) = query.message.as_ref() else {
+        return Ok(None);
+    };
+    let origin_chat_type = chat_type_from_chat(message.chat());
+    let denial = match private_cancel_authority(
+        bot,
+        alert,
+        message.chat().id.0,
+        &origin_chat_type,
+        requester,
+    )
+    .await
+    {
+        PrivateCancelAuthority::Owner => return Ok(Some(false)),
+        PrivateCancelAuthority::GroupAdmin => return Ok(Some(true)),
+        PrivateCancelAuthority::Denied => m::cancel_not_allowed(lang),
+        PrivateCancelAuthority::Unavailable => m::group_admin_check_failed(lang),
+    };
+    bot.answer_callback_query(query.id.clone())
+        .text(denial)
+        .show_alert(true)
+        .await?;
+    Ok(None)
+}
+
 async fn handle_cancel_callback(
     bot: &Bot,
     store: &PgStore,
@@ -531,10 +669,26 @@ async fn handle_cancel_callback(
             .await?;
         return Ok(());
     };
-    if !shared_callback_mutation_allowed(bot, query, &alert, lang).await? {
+    let Some(admin_override) =
+        callback_cancel_admin_override(bot, query, &alert, requester, lang).await?
+    else {
         return Ok(());
-    }
-    match store.cancel_alert(alert_id, requester).await? {
+    };
+    let origin_message = query
+        .message
+        .as_ref()
+        .expect("origin callback was checked before cancellation");
+    let origin_chat_type = chat_type_from_chat(origin_message.chat());
+    match store
+        .cancel_alert(
+            alert_id,
+            requester,
+            origin_message.chat().id.0,
+            &origin_chat_type,
+            admin_override,
+        )
+        .await?
+    {
         CancelAlertOutcome::Cancelled => {
             if let Some(msg) = query.message.as_ref() {
                 bot.edit_message_text(msg.chat().id, msg.id(), m::cancelled_inline(lang, alert_id))
@@ -677,9 +831,8 @@ fn snooze_fire_at(offset_secs: i64, now: chrono::DateTime<Utc>) -> Option<chrono
     now.checked_add_signed(chrono::Duration::seconds(offset_secs))
 }
 
-/// Stop the recurring series: reuses the existing `cancel_alert` flow (which
-/// enforces `Alert::can_edit`). For shared galert anyone may stop; for private
-/// alerts only the creator. Falls back to a `not allowed` toast otherwise.
+/// Stop the recurring series through the same owner/admin authorization and
+/// row-locked storage boundary as cancellation.
 async fn handle_stop_series_callback(
     bot: &Bot,
     store: &PgStore,
@@ -695,10 +848,26 @@ async fn handle_stop_series_callback(
             .await?;
         return Ok(());
     };
-    if !shared_callback_mutation_allowed(bot, query, &alert, lang).await? {
+    let Some(admin_override) =
+        callback_cancel_admin_override(bot, query, &alert, requester, lang).await?
+    else {
         return Ok(());
-    }
-    match store.cancel_alert(alert_id, requester).await? {
+    };
+    let origin_message = query
+        .message
+        .as_ref()
+        .expect("origin callback was checked before cancellation");
+    let origin_chat_type = chat_type_from_chat(origin_message.chat());
+    match store
+        .cancel_alert(
+            alert_id,
+            requester,
+            origin_message.chat().id.0,
+            &origin_chat_type,
+            admin_override,
+        )
+        .await?
+    {
         CancelAlertOutcome::Cancelled => {
             // Strip buttons first — the series is gone, so the +5m / Serie beenden
             // controls on this delivered message would all no-op or surprise the user.
@@ -774,7 +943,11 @@ pub async fn handle_unhandled(bot: Bot, msg: Message, store: Arc<PgStore>) -> Ha
 // ---------------------------------------------------------------------------
 
 fn chat_type_from_msg(msg: &Message) -> ChatType {
-    match &msg.chat.kind {
+    chat_type_from_chat(&msg.chat)
+}
+
+fn chat_type_from_chat(chat: &teloxide::types::Chat) -> ChatType {
+    match &chat.kind {
         ChatKind::Private(_) => ChatType::Private,
         ChatKind::Public(public) => match public.kind {
             PublicChatKind::Group => ChatType::Group,
@@ -898,6 +1071,53 @@ mod tests {
         result
     }
 
+    fn private_alert(chat_id: i64, chat_type: ChatType) -> botcore::Alert {
+        let now = Utc::now();
+        botcore::Alert {
+            id: 1,
+            user_id: 42,
+            chat_id,
+            chat_type,
+            scope: AlertScope::Private,
+            text: "cleanup".into(),
+            fire_at: now,
+            schedule: botcore::Schedule::one_shot(now, chrono_tz::UTC),
+            state: botcore::AlertState::Pending,
+            attempts: 0,
+            last_error: None,
+            claimed_at: None,
+            claim_generation: 0,
+            fired_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn private_authority_from_mock(
+        response: &'static str,
+        alert: &botcore::Alert,
+        origin_chat_id: i64,
+        origin_chat_type: &ChatType,
+        requester_user_id: i64,
+    ) -> PrivateCancelAuthority {
+        let app = axum::Router::new().fallback(move || async move { response });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = private_cancel_authority(
+            &Bot::new("123:test").set_api_url(url),
+            alert,
+            origin_chat_id,
+            origin_chat_type,
+            requester_user_id,
+        )
+        .await;
+        server.abort();
+        result
+    }
+
     #[tokio::test]
     async fn shared_membership_accepts_current_members() {
         let response = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"member"}}"#;
@@ -923,6 +1143,101 @@ mod tests {
         assert_eq!(
             membership_from_mock(response).await,
             SharedMembership::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn private_owner_cancels_without_telegram_lookup() {
+        let alert = private_alert(-100, ChatType::Group);
+        assert_eq!(
+            private_authority_from_mock(
+                r#"{"ok":false,"error_code":500,"description":"must not be called"}"#,
+                &alert,
+                -100,
+                &ChatType::Group,
+                42,
+            )
+            .await,
+            PrivateCancelAuthority::Owner
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_group_administrator_can_cancel_private_alert() {
+        let alert = private_alert(-100, ChatType::Group);
+        let response = r#"{"ok":true,"result":[{"user":{"id":7,"is_bot":false,"first_name":"Admin"},"status":"creator","is_anonymous":false}]}"#;
+        assert_eq!(
+            private_authority_from_mock(
+                response,
+                &alert,
+                -100,
+                &ChatType::Group,
+                7,
+            )
+            .await,
+            PrivateCancelAuthority::GroupAdmin
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_member_cannot_cancel_private_group_alert() {
+        let alert = private_alert(-100, ChatType::Group);
+        assert_eq!(
+            private_authority_from_mock(
+                r#"{"ok":true,"result":[]}"#,
+                &alert,
+                -100,
+                &ChatType::Group,
+                7,
+            )
+            .await,
+            PrivateCancelAuthority::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn administrator_lookup_errors_fail_closed() {
+        let alert = private_alert(-100, ChatType::Group);
+        assert_eq!(
+            private_authority_from_mock(
+                r#"{"ok":false,"error_code":400,"description":"Bad Request"}"#,
+                &alert,
+                -100,
+                &ChatType::Group,
+                7,
+            )
+            .await,
+            PrivateCancelAuthority::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_override_rejects_private_and_wrong_chat_origins() {
+        let group_alert = private_alert(-100, ChatType::Group);
+        let visible_admin = r#"{"ok":true,"result":[{"user":{"id":7,"is_bot":false,"first_name":"Admin"},"status":"creator","is_anonymous":false}]}"#;
+        assert_eq!(
+            private_authority_from_mock(
+                visible_admin,
+                &group_alert,
+                -200,
+                &ChatType::Group,
+                7,
+            )
+            .await,
+            PrivateCancelAuthority::Denied
+        );
+
+        let private_alert = private_alert(7, ChatType::Private);
+        assert_eq!(
+            private_authority_from_mock(
+                visible_admin,
+                &private_alert,
+                7,
+                &ChatType::Private,
+                8,
+            )
+            .await,
+            PrivateCancelAuthority::Denied
         );
     }
 
@@ -965,6 +1280,36 @@ mod tests {
         let row = &kb.inline_keyboard[0];
         assert_eq!(row.len(), 4);
         assert_eq!(callback_data(&row[3]), "stop_series:7");
+    }
+
+    #[test]
+    fn private_group_recurrence_is_rejected_before_creation() {
+        for chat_type in [ChatType::Group, ChatType::Supergroup] {
+            assert!(rejects_private_group_recurrence(
+                AlertScope::Private,
+                &chat_type,
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn one_shots_dms_and_shared_recurrence_remain_allowed() {
+        assert!(!rejects_private_group_recurrence(
+            AlertScope::Private,
+            &ChatType::Group,
+            false
+        ));
+        assert!(!rejects_private_group_recurrence(
+            AlertScope::Private,
+            &ChatType::Private,
+            true
+        ));
+        assert!(!rejects_private_group_recurrence(
+            AlertScope::Shared,
+            &ChatType::Group,
+            true
+        ));
     }
 
     #[test]

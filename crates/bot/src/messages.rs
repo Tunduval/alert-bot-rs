@@ -501,6 +501,17 @@ pub fn shared_membership_check_failed(lang: Language) -> &'static str {
     }
 }
 
+pub fn group_admin_check_failed(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Ich konnte deinen Gruppenadmin-Status nicht prüfen. Der Reminder bleibt bestehen."
+        }
+        Language::En => {
+            "I couldn't verify your group administrator status. The reminder was not changed."
+        }
+    }
+}
+
 pub fn cancel_not_found(lang: Language) -> &'static str {
     match lang {
         Language::De => "Reminder nicht gefunden.",
@@ -519,6 +530,17 @@ pub fn galert_dm_rejected(lang: Language) -> &'static str {
     match lang {
         Language::De => "/galert funktioniert nur in Gruppen. Im Privatchat nimm /alert.",
         Language::En => "/galert only works in groups. In DMs use /alert.",
+    }
+}
+
+pub fn private_group_recurrence_rejected(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Private Serien sind in Gruppen nicht erlaubt. Nutze /galert, damit jedes aktuelle Gruppenmitglied die Serie stoppen kann."
+        }
+        Language::En => {
+            "Private recurring reminders aren't allowed in groups. Use /galert so any current group member can stop the series."
+        }
     }
 }
 

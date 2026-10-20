@@ -533,24 +533,39 @@ impl PgStore {
         &self,
         id: i64,
         requester_user_id: i64,
+        origin_chat_id: i64,
+        origin_chat_type: &ChatType,
+        allow_group_admin_override: bool,
     ) -> Result<CancelAlertOutcome> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT user_id, scope, state FROM alerts WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let row = sqlx::query(
+            "SELECT user_id, chat_id, chat_type, scope, state
+             FROM alerts WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some(row) = row else {
             return Ok(CancelAlertOutcome::NotCancellable);
         };
         let user_id: i64 = row.try_get("user_id")?;
+        let chat_id: i64 = row.try_get("chat_id")?;
+        let chat_type_value: String = row.try_get("chat_type")?;
+        let chat_type = ChatType::parse(&chat_type_value)
+            .ok_or_else(|| StorageError::InvalidEnum(chat_type_value.clone()))?;
         let scope_value: String = row.try_get("scope")?;
         let scope = AlertScope::parse(&scope_value)
             .ok_or_else(|| StorageError::InvalidEnum(scope_value.clone()))?;
         let state_value: String = row.try_get("state")?;
         let state = AlertState::parse(&state_value)
             .ok_or_else(|| StorageError::InvalidEnum(state_value.clone()))?;
+        if chat_id != origin_chat_id || &chat_type != origin_chat_type {
+            return Ok(CancelAlertOutcome::NotCancellable);
+        }
         let allowed = match scope {
-            AlertScope::Private => user_id == requester_user_id,
+            AlertScope::Private => {
+                user_id == requester_user_id || (allow_group_admin_override && chat_type.is_group())
+            }
             AlertScope::Shared => true,
         };
         if !allowed {
@@ -964,6 +979,27 @@ mod tests {
             .unwrap()
     }
 
+    async fn private_group_alert(store: &PgStore, text: &str, due: bool) -> Alert {
+        store.upsert_user(42, Language::De).await.unwrap();
+        let at = if due {
+            Utc::now() - chrono::Duration::minutes(1)
+        } else {
+            Utc::now() + chrono::Duration::hours(1)
+        };
+        store
+            .create_alert(NewAlert {
+                user_id: 42,
+                chat_id: -100,
+                chat_type: ChatType::Group,
+                scope: AlertScope::Private,
+                text: text.into(),
+                fire_at: at,
+                schedule: Schedule::one_shot(at, chrono_tz::UTC),
+            })
+            .await
+            .unwrap()
+    }
+
     async fn expire_claim(store: &PgStore, id: i64) {
         sqlx::query("UPDATE alerts SET claimed_at = now() - interval '61 seconds' WHERE id = $1")
             .bind(id)
@@ -1035,7 +1071,10 @@ mod tests {
         let old = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
         expire_claim(&store, old.id).await;
         assert_eq!(
-            store.cancel_alert(old.id, 42).await.unwrap(),
+            store
+                .cancel_alert(old.id, 42, 42, &ChatType::Private, false)
+                .await
+                .unwrap(),
             CancelAlertOutcome::Cancelled
         );
         assert!(!store.mark_sent(old.id, old.claim_generation).await.unwrap());
@@ -1059,6 +1098,113 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn owner_cancellation_needs_no_admin_override(pool: PgPool) {
+        let store = PgStore { pool };
+        let alert = private_group_alert(&store, "owner cleanup", false).await;
+
+        assert_eq!(
+            store
+                .cancel_alert(alert.id, 42, -100, &ChatType::Group, false)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::Cancelled
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn group_admin_override_is_bound_to_stored_chat(pool: PgPool) {
+        let store = PgStore { pool };
+        let alert = private_group_alert(&store, "admin cleanup", false).await;
+
+        for (chat_id, chat_type, admin_override) in [
+            (-200, ChatType::Group, true),
+            (-100, ChatType::Supergroup, true),
+            (-100, ChatType::Group, false),
+        ] {
+            assert_eq!(
+                store
+                    .cancel_alert(alert.id, 7, chat_id, &chat_type, admin_override)
+                    .await
+                    .unwrap(),
+                CancelAlertOutcome::NotCancellable
+            );
+        }
+        assert_eq!(
+            store
+                .cancel_alert(alert.id, 7, -100, &ChatType::Group, true)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::Cancelled
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn admin_override_never_applies_to_private_chats(pool: PgPool) {
+        let store = PgStore { pool };
+        let alert = due_alert(&store, "private chat").await;
+
+        assert_eq!(
+            store
+                .cancel_alert(alert.id, 7, 42, &ChatType::Private, true)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::NotCancellable
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn group_admin_override_cancels_private_recurring_series(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::De).await.unwrap();
+        let at = Utc::now() + chrono::Duration::minutes(30);
+        let alert = store
+            .create_alert(NewAlert {
+                user_id: 42,
+                chat_id: -100,
+                chat_type: ChatType::Group,
+                scope: AlertScope::Private,
+                text: "legacy series".into(),
+                fire_at: at,
+                schedule: Schedule::interval_seconds(at, chrono_tz::UTC, 1_800).unwrap(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .cancel_alert(alert.id, 7, -100, &ChatType::Group, true)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::Cancelled
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn group_admin_stop_preserves_delivery_started_semantics(pool: PgPool) {
+        let store = PgStore { pool };
+        private_group_alert(&store, "already sending", true).await;
+        let claimed = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        start_delivery(&store, &claimed).await;
+
+        assert_eq!(
+            store
+                .cancel_alert(claimed.id, 7, -100, &ChatType::Group, true)
+                .await
+                .unwrap(),
+            CancelAlertOutcome::DeliveryStarted
+        );
+        assert_eq!(
+            store.get_alert(claimed.id).await.unwrap().unwrap().state,
+            AlertState::Sending
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
     async fn cancelling_a_live_claim_blocks_worker_finalization(pool: PgPool) {
         let store = PgStore { pool };
         due_alert(&store, "cancel claimed").await;
@@ -1066,7 +1212,13 @@ mod tests {
 
         assert_eq!(
             store
-                .cancel_alert(claimed.id, claimed.user_id)
+                .cancel_alert(
+                    claimed.id,
+                    claimed.user_id,
+                    claimed.chat_id,
+                    &claimed.chat_type,
+                    false,
+                )
                 .await
                 .unwrap(),
             CancelAlertOutcome::Cancelled
@@ -1091,9 +1243,16 @@ mod tests {
         let store = PgStore { pool };
         due_alert(&store, "race").await;
         let claimed = store.claim_due_alerts(1, 5).await.unwrap().remove(0);
+        let origin_chat_type = claimed.chat_type.clone();
 
         let (cancel, begin) = tokio::join!(
-            store.cancel_alert(claimed.id, claimed.user_id),
+            store.cancel_alert(
+                claimed.id,
+                claimed.user_id,
+                claimed.chat_id,
+                &origin_chat_type,
+                false,
+            ),
             store.begin_delivery(claimed.id, claimed.claim_generation)
         );
         match (cancel.unwrap(), begin.unwrap()) {
@@ -1119,7 +1278,13 @@ mod tests {
 
         assert_eq!(
             store
-                .cancel_alert(claimed.id, claimed.user_id)
+                .cancel_alert(
+                    claimed.id,
+                    claimed.user_id,
+                    claimed.chat_id,
+                    &claimed.chat_type,
+                    false,
+                )
                 .await
                 .unwrap(),
             CancelAlertOutcome::DeliveryStarted
