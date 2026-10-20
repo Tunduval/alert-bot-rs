@@ -249,7 +249,7 @@ sudo -u postgres psql --dbname alertbot --command 'SELECT pg_reload_conf();'
 sudo -u postgres psql --dbname alertbot --command \
   'SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL;'
 
-# Sanity check — should print a row count of 0.
+# Peer-authentication sanity check — must succeed and print a row count.
 sudo -u alertbot psql -d alertbot -c "SELECT count(*) FROM pg_tables WHERE schemaname='public';"
 # The HBA isolation check must fail.
 ! sudo -u alertbot psql -d postgres -c 'SELECT 1;'
