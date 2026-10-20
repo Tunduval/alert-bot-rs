@@ -931,6 +931,8 @@ fn try_recurring_month_day(
 }
 
 fn parse_month_day_token(s: &str) -> Option<(u8, u8)> {
+    // `24.12.` is the usual German spelling, like in one-shot dates.
+    let s = s.strip_suffix('.').unwrap_or(s);
     let parts: Vec<&str> = s.split('.').collect();
     if parts.len() != 2 {
         return None;

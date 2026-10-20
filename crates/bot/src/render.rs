@@ -171,31 +171,25 @@ pub fn format_recurrence_short(schedule: &Schedule, lang: Language) -> Option<St
     })
 }
 
-/// Compact human-readable duration, e.g. "5min", "2h 30min", "3d 4h".
+/// Compact human-readable duration, e.g. "5min", "2h 30min", "1d 30min".
+/// Every non-zero unit is shown, so an interval reads exactly as scheduled.
 pub fn format_duration_human(secs: i64) -> String {
     let secs = secs.max(0);
-    if secs < 60 {
-        return format!("{secs}s");
+    if secs == 0 {
+        return "0s".to_string();
     }
-    let minutes = secs / 60;
-    if minutes < 60 {
-        return format!("{minutes}min");
-    }
-    let hours = minutes / 60;
-    let leftover_min = minutes % 60;
-    if hours < 24 {
-        if leftover_min == 0 {
-            return format!("{hours}h");
-        }
-        return format!("{hours}h {leftover_min}min");
-    }
-    let days = hours / 24;
-    let leftover_h = hours % 24;
-    if leftover_h == 0 {
-        format!("{days}d")
-    } else {
-        format!("{days}d {leftover_h}h")
-    }
+    let parts = [
+        (secs / 86_400, "d"),
+        (secs / 3600 % 24, "h"),
+        (secs / 60 % 60, "min"),
+        (secs % 60, "s"),
+    ];
+    parts
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, unit)| format!("{n}{unit}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn month_name_short(m: u32, lang: Language) -> &'static str {
@@ -229,6 +223,28 @@ mod tests {
         assert_eq!(
             format_recurrence_short(&schedule, Language::De).as_deref(),
             Some("jeden 30. 09:00")
+        );
+    }
+
+    #[test]
+    fn durations_keep_every_unit() {
+        assert_eq!(format_duration_human(0), "0s");
+        assert_eq!(format_duration_human(45), "45s");
+        assert_eq!(format_duration_human(30 * 60), "30min");
+        assert_eq!(format_duration_human(30 * 60 + 15), "30min 15s");
+        assert_eq!(format_duration_human(2 * 3600 + 30 * 60), "2h 30min");
+        assert_eq!(format_duration_human(86_400), "1d");
+        assert_eq!(format_duration_human(86_400 + 30 * 60), "1d 30min");
+        assert_eq!(format_duration_human(25 * 3600 + 30 * 60), "1d 1h 30min");
+    }
+
+    #[test]
+    fn minutely_rule_renders_the_full_interval() {
+        let (dtstart, tz, _) = anchor();
+        let s = Schedule::from_db(dtstart, tz, Some("FREQ=MINUTELY;INTERVAL=1470")).unwrap();
+        assert_eq!(
+            format_recurrence_short(&s, Language::De).as_deref(),
+            Some("alle 1d 30min")
         );
     }
 

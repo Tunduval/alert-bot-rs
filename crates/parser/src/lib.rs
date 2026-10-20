@@ -827,6 +827,13 @@ mod tests {
     }
 
     #[test]
+    fn rec_yearly_accepts_a_trailing_dot() {
+        let r = p("*24.12. heiligabend");
+        assert_eq!(r.text, "heiligabend");
+        assert_eq!(rrule(&r), rrule(&p("*24.12 heiligabend")));
+    }
+
+    #[test]
     fn rec_yearly_29_feb_uses_last_day_and_emits_note() {
         let r = p("*29.2 schaltjahr");
         let s = rrule(&r);
