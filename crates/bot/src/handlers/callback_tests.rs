@@ -2,10 +2,13 @@ use super::*;
 use sqlx::{ConnectOptions, PgPool};
 use std::sync::Mutex;
 
-/// Returns the captured Telegram requests as (path, body) pairs.
-async fn assert_unrelated_message_is_preserved(
+/// Sends `<action>:<own alert id>` from a source message whose button names
+/// either the same data (`genuine`) or another user's alert. Returns the
+/// captured Telegram requests as (path, body) pairs.
+async fn dispatch_from_source_message(
     pool: PgPool,
     action: &str,
+    genuine: bool,
 ) -> Vec<(String, String)> {
     let store = PgStore::connect(pool.connect_options().to_url_lossy().as_str(), 5)
         .await
@@ -55,18 +58,24 @@ async fn assert_unrelated_message_is_preserved(
         .parse()
         .unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let data = format!("{action}:{}", own.id);
+    let button_data = if genuine {
+        data.clone()
+    } else {
+        format!("cancel:{}", other.id)
+    };
     let query: CallbackQuery = serde_json::from_value(serde_json::json!({
-        "id": "altered-callback",
+        "id": "callback-id",
         "from": {"id": 42, "is_bot": false, "first_name": "Test"},
         "chat_instance": "test",
-        "data": format!("{action}:{}", own.id),
+        "data": data,
         "message": {
             "message_id": 999, "date": 1,
             "chat": {"id": -100, "type": "group"},
-            "text": "Other reminder",
+            "text": "Source reminder",
             "reply_markup": {"inline_keyboard": [[{
-                "text": "Cancel",
-                "callback_data": format!("cancel:{}", other.id)
+                "text": "Button",
+                "callback_data": button_data
             }]]}
         }
     }))
@@ -83,15 +92,14 @@ async fn assert_unrelated_message_is_preserved(
     assert!(requests
         .iter()
         .any(|(path, _)| path.ends_with("/AnswerCallbackQuery")));
-    assert!(
-        !requests
-            .iter()
-            .any(|(path, _)| path.contains("/EditMessage")),
-        "an altered callback must not edit the unrelated source message: {requests:?}"
-    );
+    let own_state = if action.starts_with("snooze") {
+        botcore::AlertState::Pending
+    } else {
+        botcore::AlertState::Cancelled
+    };
     assert_eq!(
         store.get_alert(own.id).await.unwrap().unwrap().state,
-        botcore::AlertState::Cancelled
+        own_state
     );
     assert_eq!(
         store.get_alert(other.id).await.unwrap().unwrap().state,
@@ -101,16 +109,25 @@ async fn assert_unrelated_message_is_preserved(
     requests
 }
 
+fn edits(requests: &[(String, String)]) -> Vec<&str> {
+    requests
+        .iter()
+        .filter(|(path, _)| path.contains("/EditMessage"))
+        .map(|(path, _)| path.as_str())
+        .collect()
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
 async fn cancel_preserves_another_users_message(pool: PgPool) {
-    assert_unrelated_message_is_preserved(pool, "cancel").await;
+    let requests = dispatch_from_source_message(pool, "cancel", false).await;
+    assert!(edits(&requests).is_empty(), "{requests:?}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
 async fn cancel_answers_in_the_requesters_language(pool: PgPool) {
-    let requests = assert_unrelated_message_is_preserved(pool, "cancel").await;
+    let requests = dispatch_from_source_message(pool, "cancel", false).await;
     let (_, answer) = requests
         .iter()
         .find(|(path, _)| path.ends_with("/AnswerCallbackQuery"))
@@ -124,5 +141,35 @@ async fn cancel_answers_in_the_requesters_language(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
 async fn stop_series_preserves_another_users_buttons(pool: PgPool) {
-    assert_unrelated_message_is_preserved(pool, "stop_series").await;
+    let requests = dispatch_from_source_message(pool, "stop_series", false).await;
+    assert!(edits(&requests).is_empty(), "{requests:?}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+async fn snooze_preserves_another_users_buttons(pool: PgPool) {
+    let requests = dispatch_from_source_message(pool, "snooze:300", false).await;
+    assert!(edits(&requests).is_empty(), "{requests:?}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+async fn cancel_marks_its_own_message_cancelled(pool: PgPool) {
+    let requests = dispatch_from_source_message(pool, "cancel", true).await;
+    assert_eq!(
+        edits(&requests),
+        ["/bot123:test/EditMessageText"],
+        "{requests:?}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+async fn stop_series_clears_its_own_buttons(pool: PgPool) {
+    let requests = dispatch_from_source_message(pool, "stop_series", true).await;
+    assert_eq!(
+        edits(&requests),
+        ["/bot123:test/EditMessageReplyMarkup"],
+        "{requests:?}"
+    );
 }

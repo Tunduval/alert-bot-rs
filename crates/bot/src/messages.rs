@@ -209,6 +209,10 @@ pub fn galert_confirmation(
     }
 }
 
+pub fn cancelled_inline(_lang: Language, id: i64) -> String {
+    format!("✗ #{id} · cancelled")
+}
+
 pub fn button_cancel(lang: Language) -> &'static str {
     match lang {
         Language::De => "✗ Löschen",

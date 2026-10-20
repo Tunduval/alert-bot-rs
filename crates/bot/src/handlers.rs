@@ -6,8 +6,8 @@ use chrono::Utc;
 use chrono_tz::Tz;
 use teloxide::prelude::*;
 use teloxide::types::{
-    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode,
-    PublicChatKind, Recipient, UserId,
+    BotCommand, BotCommandScope, ChatKind, InlineKeyboardButton, InlineKeyboardButtonKind,
+    InlineKeyboardMarkup, InputFile, ParseMode, PublicChatKind, Recipient, UserId,
 };
 
 use botcore::{AlertScope, ChatType, Language, NewAlert, Schedule};
@@ -648,6 +648,11 @@ async fn handle_cancel_callback(
     let ok = store.cancel_alert(alert_id, requester).await?;
 
     if ok {
+        if let Some(msg) = query.message.as_ref().filter(|_| source_message_offers(query)) {
+            bot.edit_message_text(msg.chat().id, msg.id(), m::cancelled_inline(lang, alert_id))
+                .await
+                .ok();
+        }
         bot.answer_callback_query(query.id.clone())
             .text(m::callback_cancelled(lang))
             .await?;
@@ -777,6 +782,9 @@ async fn handle_stop_series_callback(
     let requester = query.from.id.0 as i64;
     let ok = store.cancel_alert(alert_id, requester).await?;
     if ok {
+        // Strip buttons first — the series is gone, so the +5m / Serie beenden
+        // controls on this delivered message would all no-op or surprise the user.
+        clear_inline_buttons(bot, query).await;
         if let Some(msg) = query.message.as_ref() {
             bot.send_message(msg.chat().id, m::series_stopped(lang, alert_id))
                 .await?;
@@ -793,11 +801,30 @@ async fn handle_stop_series_callback(
     Ok(())
 }
 
-/// Remove the inline keyboard from the message that originated this callback.
-/// Best-effort: silently ignores edit failures (most common one being a
-/// message older than Telegram's 48h edit window).
+/// Whether the callback's source message carries a button with exactly this
+/// callback data. Telegram supplies the source message, but a client can send
+/// any callback data, so only a matching button ties the message to the alert
+/// that the data names. Edits to the source message require this.
+fn source_message_offers(query: &CallbackQuery) -> bool {
+    let (Some(data), Some(msg)) = (
+        query.data.as_deref(),
+        query.message.as_ref().and_then(|m| m.regular_message()),
+    ) else {
+        return false;
+    };
+    msg.reply_markup().is_some_and(|markup| {
+        markup.inline_keyboard.iter().flatten().any(|button| {
+            matches!(&button.kind, InlineKeyboardButtonKind::CallbackData(d) if d == data)
+        })
+    })
+}
+
+/// Remove the inline keyboard from the message that originated this callback,
+/// if that message offered this callback. Best-effort: silently ignores edit
+/// failures (most common one being a message older than Telegram's 48h edit
+/// window).
 async fn clear_inline_buttons(bot: &Bot, query: &CallbackQuery) {
-    if let Some(msg) = query.message.as_ref() {
+    if let Some(msg) = query.message.as_ref().filter(|_| source_message_offers(query)) {
         let empty: InlineKeyboardMarkup =
             InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new());
         bot.edit_message_reply_markup(msg.chat().id, msg.id())
@@ -930,7 +957,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use teloxide::requests::HasPayload;
-    use teloxide::types::InlineKeyboardButtonKind;
 
     const MEMBER: &str = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"member"}}"#;
     const LEFT: &str = r#"{"ok":true,"result":{"user":{"id":42,"is_bot":false,"first_name":"Test"},"status":"left"}}"#;
