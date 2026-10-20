@@ -89,11 +89,16 @@ async fn main() -> Result<()> {
         // exhausted users, before the persistent deduplication write.
         // Otherwise edited/channel updates or a command flood can grow
         // processed_updates without reaching a rate-limited handler.
-        .filter_async(|update: Update, me: Me, store: Arc<PgStore>, limiter: Arc<CommandRateLimiter>| async move {
+        .filter_async(|update: Update, bot: Bot, me: Me, store: Arc<PgStore>, limiter: Arc<CommandRateLimiter>| async move {
             let Some(user_id) = ingress_user_id(&update) else {
                 return false;
             };
             if is_rate_limited(&update, &me) && !limiter.check(user_id) {
+                // Rate-limited commands stay silent, but an unanswered
+                // callback leaves the button's loading indicator spinning.
+                if let UpdateKind::CallbackQuery(query) = &update.kind {
+                    handlers::answer_rate_limited_callback(&bot, query).await;
+                }
                 return false;
             }
 

@@ -430,6 +430,17 @@ async fn update_chat_command_menu_if_dm(bot: &Bot, msg: &Message, lang: Language
 // Callback queries (inline keyboard button clicks)
 // ---------------------------------------------------------------------------
 
+/// Answer a callback the ingress rate limit rejected. Without an answer the
+/// button's loading indicator keeps spinning until Telegram gives up.
+pub async fn answer_rate_limited_callback(bot: &Bot, query: &CallbackQuery) {
+    let lang = Language::from_telegram_code(query.from.language_code.as_deref());
+    bot.answer_callback_query(query.id.clone())
+        .text(m::rate_limited(lang))
+        .show_alert(false)
+        .await
+        .ok();
+}
+
 pub async fn callback_dispatch(
     bot: Bot,
     query: CallbackQuery,
@@ -1299,5 +1310,26 @@ mod tests {
         let pages = paginate_list("h", &lines, 4000);
         assert_eq!(pages.len(), 2);
         assert!(pages.iter().all(|page| page.visible_len <= 4000));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_callbacks_are_answered_in_the_users_language() {
+        let (bot, requests, server) = mock_telegram(MEMBER).await;
+        let query: CallbackQuery = serde_json::from_str(
+            r#"{
+                "id":"callback-id",
+                "from":{"id":42,"is_bot":false,"first_name":"Test","language_code":"en"},
+                "chat_instance":"instance-id",
+                "data":"cancel:1"
+            }"#,
+        )
+        .unwrap();
+        answer_rate_limited_callback(&bot, &query).await;
+        server.abort();
+
+        let requests = recorded(&requests);
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.ends_with("/AnswerCallbackQuery"));
+        assert!(requests[0].1.contains(m::rate_limited(Language::En)));
     }
 }
