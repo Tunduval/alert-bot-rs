@@ -494,22 +494,20 @@ fn parse_dotted_date(s: &str, time: NaiveTime, ctx: &ParseContext) -> Option<Nai
     }
     let day: u32 = parts[0].parse().ok()?;
     let month: u32 = parts[1].parse().ok()?;
-    let now_local = ctx.now_utc.with_timezone(&ctx.tz);
-    let year: i32 = if parts.len() == 3 {
+    if parts.len() == 3 {
         let y: i32 = parts[2].parse().ok()?;
-        if y < 100 {
-            2000 + y
-        } else {
-            y
-        }
-    } else {
-        let current = now_local.year();
-        match NaiveDate::from_ymd_opt(current, month, day) {
-            Some(d) if local_to_utc(d, time, ctx.tz).is_ok_and(|at| at > ctx.now_utc) => current,
-            _ => current + 1,
-        }
-    };
-    NaiveDate::from_ymd_opt(year, month, day)
+        let year = if y < 100 { 2000 + y } else { y };
+        return NaiveDate::from_ymd_opt(year, month, day);
+    }
+    // A year-less date is its next occurrence. Feb 29 can be up to eight
+    // years away (2096 to 2104), so search that far. Any later year is
+    // already in the future; only this year's date must be checked.
+    let current = ctx.now_utc.with_timezone(&ctx.tz).year();
+    (current..=current + 8).find_map(|year| {
+        NaiveDate::from_ymd_opt(year, month, day).filter(|d| {
+            year > current || local_to_utc(*d, time, ctx.tz).is_ok_and(|at| at > ctx.now_utc)
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------

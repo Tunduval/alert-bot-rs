@@ -400,6 +400,13 @@ mod tests {
     }
 
     #[test]
+    fn abs_no_year_leap_day_waits_for_the_next_leap_year() {
+        // Sent in 2029: neither 2029 nor 2030 has Feb 29, the next is 2032.
+        let r = parse_at("29.2 Schalttag", local(2029, 1, 15, 12, 0)).unwrap();
+        assert_eq!(r.fire_at(), local(2032, 2, 29, 9, 0));
+    }
+
+    #[test]
     fn abs_iso_date_future() {
         let r = p("2026-12-31 sylvester");
         assert_eq!(r.fire_at(), local(2026, 12, 31, 9, 0));
