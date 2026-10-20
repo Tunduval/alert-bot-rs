@@ -259,6 +259,8 @@ feuert also noch heute Abend.
 |---|---|
 | 31. Januar + 1M | 28./29. Februar (letzter Tag des Folgemonats), einmaliger Hinweis bei Erstellung |
 | 29. Februar 2024 + 1Y | 28. Februar 2025 (Schaltjahr-Korrektur nach unten), einmaliger Hinweis |
+| `*1M`/`*3M` am 29., 30. oder 31. erstellt | feuert in kürzeren Monaten am letzten Tag des Monats, einmaliger Hinweis bei Erstellung |
+| `*1Y` am 29. Februar erstellt | feuert in Nicht-Schaltjahren am 28.2., einmaliger Hinweis bei Erstellung |
 | `*29.2` recurring im Nicht-Schaltjahr | feuert am 28.2. (Letzter-Tag-Logik), einmaliger Hinweis bei Erstellung |
 | `*31.` recurring in Februar/April/Juni/September/November | feuert am letzten Tag des Monats, einmaliger Hinweis bei Erstellung |
 | Uhrzeit fällt in DST-Lücke (z. B. 02:30 am Frühlings-Sonntag) | bumpt eine Stunde vor |

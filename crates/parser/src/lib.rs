@@ -65,6 +65,9 @@ pub enum ParseNote {
     /// `*31.` — in months shorter than 31 days, the alert fires on the last
     /// day of the month.
     MonthlyLastDay,
+    /// `*NM` created on the 29th–31st — in shorter months, the alert fires
+    /// on the last day of the month.
+    MonthlyLastDayFrom { day: u8 },
     /// `*29.2` — in non-leap years, the alert fires on Feb 28.
     YearlyFeb29Fallback,
 }
@@ -834,5 +837,41 @@ mod tests {
     #[test]
     fn rec_no_recognised_spec_after_keyword() {
         assert_eq!(err("every gibberish"), ParseError::NoTimeExpression);
+    }
+
+    fn p_at(input: &str, y: i32, m: u32, d: u32) -> Parsed {
+        let tz: Tz = "Europe/Berlin".parse().unwrap();
+        let now_local = tz.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap();
+        let ctx = ParseContext {
+            now_utc: now_local.with_timezone(&Utc),
+            tz,
+            language: Language::De,
+        };
+        parse(input, &ctx).expect("parse failed")
+    }
+
+    #[test]
+    fn rec_relative_monthly_from_day_31_keeps_short_months() {
+        // *1M on 31 Jan → 28 Feb, not 31 Mar.
+        let r = p_at("*1M miete", 2027, 1, 31);
+        assert!(rrule(&r).contains("BYSETPOS=-1"));
+        assert_eq!(r.fire_at(), local(2027, 2, 28, 12, 0));
+        assert_eq!(r.notes, vec![ParseNote::MonthlyLastDayFrom { day: 31 }]);
+    }
+
+    #[test]
+    fn rec_relative_every_three_months_from_day_31() {
+        // *3M on 31 Jan → 30 Apr, not 31 Jul.
+        let r = p_at("*3M bericht", 2027, 1, 31);
+        assert_eq!(r.fire_at(), local(2027, 4, 30, 12, 0));
+    }
+
+    #[test]
+    fn rec_relative_yearly_from_feb_29_uses_feb_28() {
+        // *1Y on 29 Feb 2028 → 28 Feb 2029, not 29 Feb 2032.
+        let r = p_at("*1Y jubiläum", 2028, 2, 29);
+        assert!(rrule(&r).contains("BYMONTHDAY=-1"));
+        assert_eq!(r.fire_at(), local(2029, 2, 28, 12, 0));
+        assert_eq!(r.notes, vec![ParseNote::YearlyFeb29Fallback]);
     }
 }
