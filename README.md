@@ -174,9 +174,9 @@ useradd --system --no-create-home --shell /usr/sbin/nologin alertbot
 sudo -u postgres createuser alertbot
 sudo -u postgres createdb -O alertbot alertbot
 
-# This service needs a dedicated PostgreSQL cluster. The query must return no
-# unexpected non-superuser login roles. Isolate any result or assign finite
-# connection limits that fit below the cluster's max_connections value.
+# This service needs a dedicated PostgreSQL cluster because connection slots
+# are cluster-wide. The query must return no unexpected non-superuser login
+# roles. Isolate every result in another cluster before continuing.
 sudo -u postgres psql --dbname alertbot --command \
   "SELECT rolname, rolconnlimit FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND rolname NOT IN ('alertbot', 'alertbot-backup');"
 
@@ -223,6 +223,11 @@ REVOKE EXECUTE ON FUNCTION
     pg_catalog.lo_unlink(oid)
 FROM PUBLIC;
 SQL
+
+# No ordinary login may consume PostgreSQL's reserved connection slots. This
+# query must return no rows.
+sudo -u postgres psql --dbname alertbot --command \
+  "SELECT rolname FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND pg_has_role(rolname, 'pg_use_reserved_connections', 'member');"
 ```
 
 Put these rules before the generic `local all all peer` rule in
