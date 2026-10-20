@@ -482,6 +482,13 @@ pub fn lang_invalid(lang: Language) -> &'static str {
     }
 }
 
+pub fn snooze_already_created(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Dieser Reminder wurde bereits verschoben.",
+        Language::En => "This reminder was already snoozed.",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

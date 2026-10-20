@@ -115,7 +115,29 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
         .await;
 
     match send {
-        Ok(_) => {
+        Ok(message) => {
+            match store
+                .record_alert_delivery(
+                    alert.id,
+                    alert.claim_generation,
+                    alert.chat_id,
+                    i64::from(message.id.0),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    id = alert.id,
+                    generation = alert.claim_generation,
+                    "delivery has no snooze receipt; callback will fail closed"
+                ),
+                Err(e) => error!(
+                    id = alert.id,
+                    generation = alert.claim_generation,
+                    error = ?e,
+                    "record_alert_delivery failed; callback will fail closed"
+                ),
+            }
             if let Err(e) = finalise_after_send(store, &alert).await {
                 error!(id = alert.id, error = ?e, "finalise_after_send failed");
             }

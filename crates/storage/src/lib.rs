@@ -9,7 +9,7 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 
 use botcore::{Alert, AlertScope, AlertState, ChatType, Language, NewAlert, Schedule, User};
@@ -29,6 +29,58 @@ pub enum StorageError {
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+fn quota_lock_keys(user_id: i64, chat_id: i64) -> (i64, Option<i64>) {
+    if user_id == chat_id {
+        (user_id, None)
+    } else if user_id < chat_id {
+        (user_id, Some(chat_id))
+    } else {
+        (chat_id, Some(user_id))
+    }
+}
+
+async fn lock_alert_quota_keys(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: i64,
+    chat_id: i64,
+) -> Result<()> {
+    let (first, second) = quota_lock_keys(user_id, chat_id);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(first)
+        .execute(&mut **tx)
+        .await?;
+    if let Some(second) = second {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(second)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AlertLimits {
+    pub max_per_user: i64,
+    pub max_per_chat: i64,
+}
+
+#[derive(Debug)]
+pub enum CreateAlertOutcome {
+    Created(Alert),
+    UserQuota { current: i64 },
+    ChatQuota { current: i64 },
+}
+
+#[derive(Debug)]
+pub enum CreateSnoozeOutcome {
+    Created(Alert),
+    Duplicate,
+    SourceGone,
+    NotAllowed,
+    UserQuota { current: i64 },
+    ChatQuota { current: i64 },
+}
 
 #[derive(Clone)]
 pub struct PgStore {
@@ -149,6 +201,216 @@ impl PgStore {
         .await?;
 
         row_to_alert(row)
+    }
+
+    pub async fn create_alert_with_limits(
+        &self,
+        new: NewAlert,
+        limits: AlertLimits,
+    ) -> Result<CreateAlertOutcome> {
+        let mut tx = self.pool.begin().await?;
+        lock_alert_quota_keys(&mut tx, new.user_id, new.chat_id).await?;
+
+        let user_count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM alerts WHERE user_id = $1 AND state IN ('pending', 'claimed')",
+        )
+        .bind(new.user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if user_count.0 >= limits.max_per_user {
+            tx.commit().await?;
+            return Ok(CreateAlertOutcome::UserQuota {
+                current: user_count.0,
+            });
+        }
+
+        let chat_count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM alerts WHERE chat_id = $1 AND state IN ('pending', 'claimed')",
+        )
+        .bind(new.chat_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if chat_count.0 >= limits.max_per_chat {
+            tx.commit().await?;
+            return Ok(CreateAlertOutcome::ChatQuota {
+                current: chat_count.0,
+            });
+        }
+
+        let row = sqlx::query(
+            r#"
+            INSERT INTO alerts (
+                user_id, chat_id, chat_type, scope, text, fire_at,
+                dtstart, rrule, tz
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
+                      dtstart, rrule, tz,
+                      state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
+            "#,
+        )
+        .bind(new.user_id)
+        .bind(new.chat_id)
+        .bind(new.chat_type.as_str())
+        .bind(new.scope.as_str())
+        .bind(&new.text)
+        .bind(new.fire_at)
+        .bind(new.schedule.dtstart)
+        .bind(new.schedule.rrule.as_deref())
+        .bind(new.schedule.tz.name())
+        .fetch_one(&mut *tx)
+        .await?;
+        let alert = row_to_alert(row)?;
+        tx.commit().await?;
+        Ok(CreateAlertOutcome::Created(alert))
+    }
+
+    /// Record the Telegram message returned by a successful send.
+    ///
+    /// The source must still be our live send. A duplicate send for the same
+    /// claim generation deliberately gets no second receipt, so it cannot
+    /// create a second snooze for that occurrence.
+    pub async fn record_alert_delivery(
+        &self,
+        source_alert_id: i64,
+        source_generation: i64,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO alert_deliveries (
+                chat_id, message_id, source_alert_id, source_claim_generation
+            )
+            SELECT $3, $4, id, claim_generation
+            FROM alerts
+            WHERE id = $1 AND claim_generation = $2
+              AND chat_id = $3 AND state = 'claimed'
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(source_alert_id)
+        .bind(source_generation)
+        .bind(chat_id)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Consume one server-recorded delivery receipt and create its snooze.
+    /// Receipt consumption, quota checks and the insert share one transaction.
+    pub async fn create_snooze_with_limits(
+        &self,
+        source_alert_id: i64,
+        requester_user_id: i64,
+        origin_chat_id: i64,
+        origin_message_id: i64,
+        fire_at: DateTime<Utc>,
+        limits: AlertLimits,
+    ) -> Result<CreateSnoozeOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let receipt: Option<(i64, Option<i64>)> = sqlx::query_as(
+            r#"
+            SELECT source_claim_generation, snoozed_alert_id
+            FROM alert_deliveries
+            WHERE chat_id = $1 AND message_id = $2 AND source_alert_id = $3
+            FOR UPDATE
+            "#,
+        )
+        .bind(origin_chat_id)
+        .bind(origin_message_id)
+        .bind(source_alert_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((source_generation, snoozed_alert_id)) = receipt else {
+            return Ok(CreateSnoozeOutcome::SourceGone);
+        };
+        if snoozed_alert_id.is_some() {
+            return Ok(CreateSnoozeOutcome::Duplicate);
+        }
+
+        let source_row = sqlx::query(
+            r#"
+            SELECT id, user_id, chat_id, chat_type, scope, text, fire_at,
+                   dtstart, rrule, tz,
+                   state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
+            FROM alerts WHERE id = $1
+            FOR SHARE
+            "#,
+        )
+        .bind(source_alert_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(source_row) = source_row else {
+            return Ok(CreateSnoozeOutcome::SourceGone);
+        };
+        let source = row_to_alert(source_row)?;
+        if source.chat_id != origin_chat_id || !source.can_edit(requester_user_id) {
+            return Ok(CreateSnoozeOutcome::NotAllowed);
+        }
+
+        lock_alert_quota_keys(&mut tx, requester_user_id, source.chat_id).await?;
+
+        let user_count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM alerts WHERE user_id = $1 AND state IN ('pending', 'claimed')",
+        )
+        .bind(requester_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if user_count.0 >= limits.max_per_user {
+            return Ok(CreateSnoozeOutcome::UserQuota {
+                current: user_count.0,
+            });
+        }
+        let chat_count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM alerts WHERE chat_id = $1 AND state IN ('pending', 'claimed')",
+        )
+        .bind(source.chat_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if chat_count.0 >= limits.max_per_chat {
+            return Ok(CreateSnoozeOutcome::ChatQuota {
+                current: chat_count.0,
+            });
+        }
+
+        let row = sqlx::query(
+            r#"
+            INSERT INTO alerts (
+                user_id, chat_id, chat_type, scope, text, fire_at,
+                dtstart, rrule, tz, snooze_source_alert_id, snooze_source_generation
+            )
+            VALUES ($1, $2, $3, 'private', $4, $5, $5, NULL, $6, $7, $8)
+            RETURNING id, user_id, chat_id, chat_type, scope, text, fire_at,
+                      dtstart, rrule, tz,
+                      state, attempts, last_error, claimed_at, claim_generation, fired_at, created_at, updated_at
+            "#,
+        )
+        .bind(requester_user_id)
+        .bind(source.chat_id)
+        .bind(source.chat_type.as_str())
+        .bind(&source.text)
+        .bind(fire_at)
+        .bind(source.schedule.tz.name())
+        .bind(source_alert_id)
+        .bind(source_generation)
+        .fetch_one(&mut *tx)
+        .await?;
+        let alert = row_to_alert(row)?;
+        sqlx::query(
+            "UPDATE alert_deliveries SET snoozed_alert_id = $4
+             WHERE chat_id = $1 AND message_id = $2 AND source_alert_id = $3
+               AND snoozed_alert_id IS NULL",
+        )
+        .bind(origin_chat_id)
+        .bind(origin_message_id)
+        .bind(source_alert_id)
+        .bind(alert.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(CreateSnoozeOutcome::Created(alert))
     }
 
     pub async fn get_alert(&self, id: i64) -> Result<Option<Alert>> {
@@ -661,5 +923,291 @@ mod tests {
         let saturated = claimed.iter().find(|a| a.id == exhausted.id).unwrap();
         assert_eq!(saturated.attempts, i16::MAX);
         assert!(claimed.iter().any(|a| a.id == healthy.id));
+    }
+
+    #[test]
+    fn quota_lock_order_is_canonical_across_id_roles() {
+        assert_eq!(quota_lock_keys(-100, 42), (-100, Some(42)));
+        assert_eq!(quota_lock_keys(42, -100), (-100, Some(42)));
+        assert_eq!(quota_lock_keys(42, 42), (42, None));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn opposite_user_chat_pairs_do_not_deadlock(pool: PgPool) {
+        let mut first = pool.begin().await.unwrap();
+        let mut second = pool.begin().await.unwrap();
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let first_start = start.clone();
+        let second_start = start;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            tokio::join!(
+                async move {
+                    first_start.wait().await;
+                    lock_alert_quota_keys(&mut first, -100, 42).await.unwrap();
+                    first.commit().await.unwrap();
+                },
+                async move {
+                    second_start.wait().await;
+                    lock_alert_quota_keys(&mut second, 42, -100).await.unwrap();
+                    second.commit().await.unwrap();
+                }
+            );
+        })
+        .await;
+
+        assert!(result.is_ok(), "opposite id roles must not deadlock");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn concurrent_chats_cannot_exceed_user_quota(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::En).await.unwrap();
+        let at = Utc::now() + chrono::Duration::hours(1);
+        let make_alert = |chat_id| NewAlert {
+            user_id: 42,
+            chat_id,
+            chat_type: ChatType::Group,
+            scope: AlertScope::Private,
+            text: "bounded".into(),
+            fire_at: at,
+            schedule: Schedule::one_shot(at, chrono_tz::UTC),
+        };
+        let limits = AlertLimits {
+            max_per_user: 1,
+            max_per_chat: 50,
+        };
+
+        let (first, second) = tokio::join!(
+            store.create_alert_with_limits(make_alert(-100), limits),
+            store.create_alert_with_limits(make_alert(-200), limits)
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CreateAlertOutcome::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CreateAlertOutcome::UserQuota { current: 1 }))
+                .count(),
+            1
+        );
+        assert_eq!(store.count_active_for_user(42).await.unwrap(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn concurrent_users_cannot_exceed_chat_quota(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::En).await.unwrap();
+        store.upsert_user(43, Language::En).await.unwrap();
+        let at = Utc::now() + chrono::Duration::hours(1);
+        let make_alert = |user_id| NewAlert {
+            user_id,
+            chat_id: -100,
+            chat_type: ChatType::Group,
+            scope: AlertScope::Private,
+            text: "bounded".into(),
+            fire_at: at,
+            schedule: Schedule::one_shot(at, chrono_tz::UTC),
+        };
+        let limits = AlertLimits {
+            max_per_user: 100,
+            max_per_chat: 1,
+        };
+
+        let (first, second) = tokio::join!(
+            store.create_alert_with_limits(make_alert(42), limits),
+            store.create_alert_with_limits(make_alert(43), limits)
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CreateAlertOutcome::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CreateAlertOutcome::ChatQuota { current: 1 }))
+                .count(),
+            1
+        );
+        assert_eq!(store.count_active_for_chat(-100).await.unwrap(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn concurrent_duplicate_snoozes_create_one_alert(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::En).await.unwrap();
+        due_alert(&store, "wake up").await;
+        let source = store.claim_due_alerts(1).await.unwrap().remove(0);
+        assert!(store
+            .record_alert_delivery(source.id, source.claim_generation, 42, 700)
+            .await
+            .unwrap());
+        let fire_at = Utc::now() + chrono::Duration::minutes(5);
+        let limits = AlertLimits {
+            max_per_user: 100,
+            max_per_chat: 50,
+        };
+
+        let (first, second) = tokio::join!(
+            store.create_snooze_with_limits(source.id, 42, 42, 700, fire_at, limits),
+            store.create_snooze_with_limits(source.id, 42, 42, 700, fire_at, limits)
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CreateSnoozeOutcome::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CreateSnoozeOutcome::Duplicate))
+                .count(),
+            1
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn delivered_message_allows_only_one_shared_snooze(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::En).await.unwrap();
+        store.upsert_user(43, Language::En).await.unwrap();
+        let at = Utc::now() - chrono::Duration::minutes(1);
+        store
+            .create_alert(NewAlert {
+                user_id: 42,
+                chat_id: -100,
+                chat_type: ChatType::Group,
+                scope: AlertScope::Shared,
+                text: "shared".into(),
+                fire_at: at,
+                schedule: Schedule::one_shot(at, chrono_tz::UTC),
+            })
+            .await
+            .unwrap();
+        let source = store.claim_due_alerts(1).await.unwrap().remove(0);
+        assert!(store
+            .record_alert_delivery(source.id, source.claim_generation, -100, 701)
+            .await
+            .unwrap());
+        let fire_at = Utc::now() + chrono::Duration::minutes(5);
+        let limits = AlertLimits {
+            max_per_user: 100,
+            max_per_chat: 50,
+        };
+
+        let (first, second) = tokio::join!(
+            store.create_snooze_with_limits(source.id, 42, -100, 701, fire_at, limits),
+            store.create_snooze_with_limits(source.id, 43, -100, 701, fire_at, limits)
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CreateSnoozeOutcome::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CreateSnoozeOutcome::Duplicate))
+                .count(),
+            1
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn delivery_receipt_cannot_be_rebound_to_another_alert(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::En).await.unwrap();
+        due_alert(&store, "first source").await;
+        let other = due_alert(&store, "other source").await;
+        let source = store.claim_due_alerts(1).await.unwrap().remove(0);
+        assert!(!store
+            .record_alert_delivery(source.id, source.claim_generation + 1, 42, 704)
+            .await
+            .unwrap());
+        assert!(store
+            .record_alert_delivery(source.id, source.claim_generation, 42, 704)
+            .await
+            .unwrap());
+        let limits = AlertLimits {
+            max_per_user: 100,
+            max_per_chat: 50,
+        };
+
+        let outcome = store
+            .create_snooze_with_limits(
+                other.id,
+                42,
+                42,
+                704,
+                Utc::now() + chrono::Duration::minutes(5),
+                limits,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CreateSnoozeOutcome::SourceGone));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    #[ignore = "requires a dedicated PostgreSQL DATABASE_URL"]
+    async fn recurring_deliveries_have_distinct_snooze_receipts(pool: PgPool) {
+        let store = PgStore { pool };
+        store.upsert_user(42, Language::En).await.unwrap();
+        due_alert(&store, "recurring-like source").await;
+        let source = store.claim_due_alerts(1).await.unwrap().remove(0);
+        assert!(store
+            .record_alert_delivery(source.id, source.claim_generation, 42, 702)
+            .await
+            .unwrap());
+        let fire_at = Utc::now() + chrono::Duration::minutes(5);
+        let limits = AlertLimits {
+            max_per_user: 100,
+            max_per_chat: 50,
+        };
+
+        let first = store
+            .create_snooze_with_limits(source.id, 42, 42, 702, fire_at, limits)
+            .await
+            .unwrap();
+        assert!(store
+            .advance_to_next_occurrence(
+                source.id,
+                source.claim_generation,
+                Utc::now() - chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap());
+        let next = store.claim_due_alerts(1).await.unwrap().remove(0);
+        assert!(store
+            .record_alert_delivery(next.id, next.claim_generation, 42, 703)
+            .await
+            .unwrap());
+        let second = store
+            .create_snooze_with_limits(next.id, 42, 42, 703, fire_at, limits)
+            .await
+            .unwrap();
+        assert!(matches!(first, CreateSnoozeOutcome::Created(_)));
+        assert!(matches!(second, CreateSnoozeOutcome::Created(_)));
     }
 }
