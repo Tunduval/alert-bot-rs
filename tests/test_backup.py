@@ -288,6 +288,7 @@ if '--quote' in args:
         self.assertIsNotNone(result["signature"])
         self.assert_valid_manifest(result)
         self.assertIn("--format=custom", result["pg_dump"])
+        self.assertIn("--no-blobs", result["pg_dump"])
         self.assertNotIn("--role", result["pg_dump"])
         self.assertEqual(len(result["renames"]), 3)
         self.assertIn(".dump.age.manifest.sig.part", result["renames"][0])

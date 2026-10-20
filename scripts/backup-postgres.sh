@@ -143,7 +143,7 @@ SIGNATURE_FILE="${MANIFEST_FILE}.sig"
 
 echo "[backup] encrypting ${DB_NAME} backup -> ${REMOTE_FILE}"
 
-pg_dump --format=custom --no-owner --no-privileges \
+pg_dump --format=custom --no-owner --no-privileges --no-blobs \
     --file="$DUMP_FILE" "$DB_NAME"
 age --encrypt --recipient "$BACKUP_AGE_RECIPIENT" \
     --output "$ENCRYPTED_FILE" "$DUMP_FILE"

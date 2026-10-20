@@ -174,8 +174,80 @@ useradd --system --no-create-home --shell /usr/sbin/nologin alertbot
 sudo -u postgres createuser alertbot
 sudo -u postgres createdb -O alertbot alertbot
 
+# This service needs a dedicated PostgreSQL cluster. The query must return no
+# unexpected non-superuser login roles. Isolate any result or assign finite
+# connection limits that fit below the cluster's max_connections value.
+sudo -u postgres psql --dbname alertbot --command \
+  "SELECT rolname, rolconnlimit FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND rolname NOT IN ('alertbot', 'alertbot-backup');"
+
+# Bound service connections and remove write-like primitives from every
+# ordinary login in this database. The app receives only the three advisory
+# lock functions it uses for migrations and quota serialization.
+sudo -u postgres psql -v ON_ERROR_STOP=1 --dbname alertbot <<'SQL'
+ALTER ROLE alertbot CONNECTION LIMIT 12;
+REVOKE CONNECT, TEMPORARY ON DATABASE alertbot FROM PUBLIC;
+GRANT CONNECT ON DATABASE alertbot TO alertbot;
+
+REVOKE EXECUTE ON FUNCTION
+    pg_catalog.pg_advisory_lock(bigint),
+    pg_catalog.pg_advisory_lock(integer, integer),
+    pg_catalog.pg_advisory_lock_shared(bigint),
+    pg_catalog.pg_advisory_lock_shared(integer, integer),
+    pg_catalog.pg_advisory_xact_lock(bigint),
+    pg_catalog.pg_advisory_xact_lock(integer, integer),
+    pg_catalog.pg_advisory_xact_lock_shared(bigint),
+    pg_catalog.pg_advisory_xact_lock_shared(integer, integer),
+    pg_catalog.pg_try_advisory_lock(bigint),
+    pg_catalog.pg_try_advisory_lock(integer, integer),
+    pg_catalog.pg_try_advisory_lock_shared(bigint),
+    pg_catalog.pg_try_advisory_lock_shared(integer, integer),
+    pg_catalog.pg_try_advisory_xact_lock(bigint),
+    pg_catalog.pg_try_advisory_xact_lock(integer, integer),
+    pg_catalog.pg_try_advisory_xact_lock_shared(bigint),
+    pg_catalog.pg_try_advisory_xact_lock_shared(integer, integer)
+FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION
+    pg_catalog.pg_advisory_lock(bigint),
+    pg_catalog.pg_advisory_unlock(bigint),
+    pg_catalog.pg_advisory_xact_lock(bigint)
+TO alertbot;
+
+REVOKE EXECUTE ON FUNCTION
+    pg_catalog.lo_creat(integer),
+    pg_catalog.lo_create(oid),
+    pg_catalog.lo_from_bytea(oid, bytea),
+    pg_catalog.lo_put(oid, bigint, bytea),
+    pg_catalog.lowrite(integer, bytea),
+    pg_catalog.lo_truncate(integer, integer),
+    pg_catalog.lo_truncate64(integer, bigint),
+    pg_catalog.lo_unlink(oid)
+FROM PUBLIC;
+SQL
+```
+
+Put these rules before the generic `local all all peer` rule in
+`/etc/postgresql/<major>/main/pg_hba.conf`. They let both service identities
+enter only the application database and reject every other database in the
+cluster:
+
+```text
+local   alertbot   alertbot,alertbot-backup   peer
+local   all        alertbot,alertbot-backup   reject
+```
+
+Reload PostgreSQL after editing the file, then verify the boundary:
+
+```bash
+sudo -u postgres psql --dbname alertbot --command 'SELECT pg_reload_conf();'
+# This query must return no rows. A successful reload alone does not prove that
+# PostgreSQL accepted every HBA rule.
+sudo -u postgres psql --dbname alertbot --command \
+  'SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL;'
+
 # Sanity check — should print a row count of 0.
 sudo -u alertbot psql -d alertbot -c "SELECT count(*) FROM pg_tables WHERE schemaname='public';"
+# The HBA isolation check must fail.
+! sudo -u alertbot psql -d postgres -c 'SELECT 1;'
 ```
 
 No password is stored anywhere — peer auth via the Unix socket binds
@@ -290,7 +362,7 @@ On the source machine (old docker-on-LXC setup):
 ```bash
 docker compose stop bot
 docker compose exec -T postgres \
-    pg_dump -U alertbot --format=custom --no-owner --no-privileges alertbot \
+    pg_dump -U alertbot --format=custom --no-owner --no-privileges --no-blobs alertbot \
     > alertbot-migration.dump
 scp alertbot-migration.dump root@<new-lxc-ip>:/root/alertbot-migration.dump
 ```
@@ -491,8 +563,10 @@ pg_dump --version  # must report at least 16.15
 
 # Keep backup credentials outside the bot's Unix identity.
 useradd --system --no-create-home --shell /usr/sbin/nologin alertbot-backup
-sudo -u postgres createuser --no-createdb --no-createrole --no-superuser alertbot-backup
+sudo -u postgres createuser --no-createdb --no-createrole --no-superuser \
+  --connection-limit=1 alertbot-backup
 sudo -u postgres psql -v ON_ERROR_STOP=1 --dbname alertbot <<'SQL'
+ALTER ROLE "alertbot-backup" SET temp_file_limit = '256MB';
 GRANT CONNECT ON DATABASE alertbot TO "alertbot-backup";
 GRANT USAGE ON SCHEMA public TO "alertbot-backup";
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO "alertbot-backup";
@@ -508,6 +582,18 @@ SQL
 # Confirm peer authentication and the narrowly scoped read access.
 sudo -u alertbot-backup psql -v ON_ERROR_STOP=1 --dbname alertbot \
   --command 'SELECT count(*) FROM alerts;'
+# The backup identity must not reach another database or write persistent
+# large objects. Both checks must fail.
+! sudo -u alertbot-backup psql --dbname postgres --command 'SELECT 1;'
+! sudo -u alertbot-backup psql --dbname alertbot --command 'SELECT lo_create(0);'
+! sudo -u alertbot-backup psql --dbname alertbot \
+  --command 'SELECT pg_try_advisory_lock(1);'
+
+# Existing installations should return no rows here. Review unexpected objects
+# before removing them with lo_unlink; --no-blobs keeps them out of backups but
+# does not reclaim their primary-database storage.
+sudo -u postgres psql --dbname alertbot --command \
+  'SELECT oid, pg_get_userbyid(lomowner) AS owner FROM pg_largeobject_metadata;'
 
 ssh-keyscan -t ed25519 yourhost.netcup.net \
   > /etc/alertbot-backup-known-hosts
@@ -576,8 +662,12 @@ which otherwise lets a crafted database object execute code in `pg_dump`.
 The unit runs as `alertbot-backup`. PostgreSQL peer authentication maps that
 Unix account to the matching database role. That role has only `CONNECT`,
 schema `USAGE`, and `SELECT` grants; it cannot assume the application owner.
-The `postgres` superuser is not required. The bot's Unix account cannot read
-the SFTP environment file or private signing key.
+It has one connection slot, cannot enter another database, cannot acquire the
+application's advisory locks, and cannot create PostgreSQL large objects.
+The dump excludes large objects because this application does not use them.
+The `postgres` superuser is not required while a backup runs. Provisioning the
+role and its access controls still requires an administrator. The bot's Unix
+account cannot read the SFTP environment file or private signing key.
 
 ### Restoring from backup
 
