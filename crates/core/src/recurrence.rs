@@ -191,6 +191,31 @@ impl Schedule {
         Self::recurring(dtstart, tz, rule)
     }
 
+    /// Every `interval` months on `day`, or on the month's last day when the
+    /// month is shorter (`*1M` created on the 30th fires on Feb 28/29).
+    /// `BYMONTHDAY=28..=day;BYSETPOS=-1` picks the latest of those days that
+    /// exists in each month. Days up to 28 exist in every month and use the
+    /// strict rule. Built as a canonical string like [`Self::monthly_last_day`].
+    pub fn monthly_every_or_last_day(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        interval: u16,
+        day: u8,
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
+        if day <= 28 {
+            return Self::monthly_every(dtstart, tz, interval, day, time);
+        }
+        let days: Vec<String> = (28..=day).map(|d| d.to_string()).collect();
+        let rrule_str = format!(
+            "FREQ=MONTHLY;INTERVAL={interval};BYMONTHDAY={};BYSETPOS=-1;BYHOUR={};BYMINUTE={}",
+            days.join(","),
+            time.hour(),
+            time.minute()
+        );
+        Self::from_canonical_string(dtstart, tz, rrule_str)
+    }
+
     /// Monthly on the last day of every month (`BYMONTHDAY=-1`). This is
     /// what `*31.` resolves to per RULES.md — in February it lands on the
     /// 28th/29th, otherwise the 30th/31st.
@@ -261,6 +286,26 @@ impl Schedule {
         }
         let rrule_str = format!(
             "FREQ=YEARLY;BYMONTH={month};BYMONTHDAY=-1;BYHOUR={};BYMINUTE={}",
+            time.hour(),
+            time.minute()
+        );
+        Self::from_canonical_string(dtstart, tz, rrule_str)
+    }
+
+    /// Every `interval` years on the last day of `month`. Used for `*1Y`
+    /// created on Feb 29, which fires on Feb 28 in non-leap years.
+    pub fn yearly_every_last_day_of_month(
+        dtstart: DateTime<Utc>,
+        tz: Tz,
+        interval: u16,
+        month: u8,
+        time: NaiveTime,
+    ) -> Result<Self, ScheduleError> {
+        if !(1..=12).contains(&month) {
+            return Err(ScheduleError::Invalid(format!("invalid month {month}")));
+        }
+        let rrule_str = format!(
+            "FREQ=YEARLY;INTERVAL={interval};BYMONTH={month};BYMONTHDAY=-1;BYHOUR={};BYMINUTE={}",
             time.hour(),
             time.minute()
         );
@@ -416,6 +461,65 @@ mod tests {
         assert_eq!(
             s.next_after(local(2026, 1, 31, 10, 0)),
             Some(local(2026, 2, 28, 9, 0))
+        );
+    }
+
+    #[test]
+    fn monthly_from_day_30_falls_back_to_the_last_day() {
+        let dts = local(2027, 2, 28, 9, 0);
+        let s = Schedule::monthly_every_or_last_day(dts, berlin(), 1, 30, t(9, 0)).unwrap();
+        let mut fires = Vec::new();
+        let mut after = local(2027, 2, 28, 10, 0);
+        for _ in 0..3 {
+            after = s.next_after(after).unwrap();
+            fires.push(after);
+        }
+        assert_eq!(
+            fires,
+            [
+                local(2027, 3, 30, 9, 0),
+                local(2027, 4, 30, 9, 0),
+                local(2027, 5, 30, 9, 0)
+            ]
+        );
+        assert_eq!(
+            s.next_after(local(2028, 1, 30, 10, 0)),
+            Some(local(2028, 2, 29, 9, 0))
+        );
+    }
+
+    #[test]
+    fn monthly_from_day_31_fires_in_every_interval() {
+        let dts = local(2027, 4, 30, 9, 0);
+        let s = Schedule::monthly_every_or_last_day(dts, berlin(), 3, 31, t(9, 0)).unwrap();
+        assert_eq!(
+            s.next_after(local(2027, 4, 30, 10, 0)),
+            Some(local(2027, 7, 31, 9, 0))
+        );
+        assert_eq!(
+            s.next_after(local(2027, 7, 31, 10, 0)),
+            Some(local(2027, 10, 31, 9, 0))
+        );
+    }
+
+    #[test]
+    fn monthly_up_to_day_28_stays_strict() {
+        let dts = local(2027, 2, 28, 9, 0);
+        let s = Schedule::monthly_every_or_last_day(dts, berlin(), 1, 28, t(9, 0)).unwrap();
+        assert!(!s.rrule.as_deref().unwrap().contains("BYSETPOS"));
+    }
+
+    #[test]
+    fn yearly_every_last_day_of_feb_fires_every_year() {
+        let dts = local(2029, 2, 28, 9, 0);
+        let s = Schedule::yearly_every_last_day_of_month(dts, berlin(), 1, 2, t(9, 0)).unwrap();
+        assert_eq!(
+            s.next_after(local(2029, 2, 28, 10, 0)),
+            Some(local(2030, 2, 28, 9, 0))
+        );
+        assert_eq!(
+            s.next_after(local(2031, 2, 28, 10, 0)),
+            Some(local(2032, 2, 29, 9, 0))
         );
     }
 

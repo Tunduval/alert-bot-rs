@@ -194,10 +194,22 @@ async fn create_alert(
         reply.push_str(&html_escape(&m::parse_note(*note, user.language)));
     }
 
-    bot.send_message(msg.chat.id, reply)
-        .reply_markup(action_keyboard(user.language, alert.id))
-        .await?;
+    confirmation_request(bot, msg.chat.id, reply, user.language, alert.id).await?;
     Ok(())
+}
+
+/// `reply` is HTML: the caller escapes user-controlled parts (creator handle,
+/// notes), so it has to be sent with `ParseMode::Html`.
+fn confirmation_request(
+    bot: &Bot,
+    chat_id: ChatId,
+    reply: String,
+    lang: Language,
+    id: i64,
+) -> <Bot as Requester>::SendMessage {
+    bot.send_message(chat_id, reply)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(action_keyboard(lang, id))
 }
 
 fn action_keyboard(lang: Language, id: i64) -> InlineKeyboardMarkup {
@@ -788,6 +800,7 @@ fn telegram_text_len(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teloxide::requests::HasPayload;
     use teloxide::types::InlineKeyboardButtonKind;
 
     #[test]
@@ -818,6 +831,15 @@ mod tests {
         assert_eq!(callback_data(&row[0]), "snooze:300:42");
         assert_eq!(callback_data(&row[1]), "snooze:900:42");
         assert_eq!(callback_data(&row[2]), "snooze:3600:42");
+    }
+
+    /// The confirmation text carries pre-escaped HTML (`Tom &amp; Jerry`), so
+    /// it must be sent with `ParseMode::Html` or the entities show up as text.
+    #[test]
+    fn confirmation_is_sent_as_html() {
+        let bot = Bot::new("123:test-token");
+        let req = confirmation_request(&bot, ChatId(1), "Tom &amp; Jerry".into(), Language::De, 7);
+        assert_eq!(req.payload_ref().parse_mode, Some(ParseMode::Html));
     }
 
     #[test]

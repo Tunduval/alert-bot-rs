@@ -94,7 +94,7 @@ pub fn help(lang: Language) -> &'static str {
             <blockquote expandable><i>Intervall</i>\n\
             *30m Wasser — alle 30 Minuten\n\
             alle 2h Pause — synonym zu *2h\n\
-            *1d Vitamin — täglich um 09:00\n\
+            *1d Vitamin — täglich zur Erstellungs-Uhrzeit\n\
             *2d 11:00 Tabletten — alle 2 Tage 11:00\n\n\
             <i>Wochentage</i>\n\
             *do 14:00 Standup — jeden Donnerstag\n\
@@ -150,7 +150,7 @@ pub fn help(lang: Language) -> &'static str {
             <blockquote expandable><i>Interval</i>\n\
             *30m water — every 30 minutes\n\
             every 2h break — synonym for *2h\n\
-            *1d vitamin — daily at 09:00\n\
+            *1d vitamin — daily at the creation time\n\
             *2d 11:00 pills — every 2 days at 11:00\n\n\
             <i>Weekdays</i>\n\
             *thu 14:00 standup — every Thursday\n\
@@ -403,6 +403,12 @@ pub fn parse_note(note: ParseNote, lang: Language) -> String {
         (ParseNote::MonthlyLastDay, Language::En) => {
             "Note: in months without a 31st, this fires on the last day of the month.".into()
         }
+        (ParseNote::MonthlyLastDayFrom { day }, Language::De) => format!(
+            "Hinweis: in Monaten ohne {day}. feuert der Reminder am letzten Tag des Monats."
+        ),
+        (ParseNote::MonthlyLastDayFrom { day }, Language::En) => {
+            format!("Note: in months without day {day}, this fires on the last day of the month.")
+        }
         (ParseNote::YearlyFeb29Fallback, Language::De) => {
             "Hinweis: in Nicht-Schaltjahren feuert dieser Reminder am 28.2..".into()
         }
@@ -497,6 +503,19 @@ mod tests {
                 len < TELEGRAM_LIMIT,
                 "help({lang:?}) is {len} chars, Telegram limit is {TELEGRAM_LIMIT}"
             );
+        }
+    }
+
+    /// `*1d` without an override fires at the creation time (RULES.md), so the
+    /// help example must not promise 09:00.
+    #[test]
+    fn help_relative_daily_example_does_not_promise_default_time() {
+        for lang in [Language::De, Language::En] {
+            let line = help(lang)
+                .lines()
+                .find(|l| l.starts_with("*1d "))
+                .unwrap_or_else(|| panic!("no *1d example in help({lang:?})"));
+            assert!(!line.contains("09:00"), "help({lang:?}): {line}");
         }
     }
 }
