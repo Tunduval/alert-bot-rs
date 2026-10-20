@@ -50,6 +50,23 @@ const TRACKED_USER_TTL: Duration = Duration::from_secs(120);
 
 pub type UserId = i64;
 
+/// Outcome of one rate-limit check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimit {
+    Allowed,
+    /// This user's own budget is exhausted.
+    UserBudgetExhausted,
+    /// The global budget or the identity ceiling rejected the request. Both
+    /// are shared by all users, so forged updates can reach them in bulk.
+    SharedCeiling,
+}
+
+impl RateLimit {
+    pub fn is_allowed(self) -> bool {
+        self == Self::Allowed
+    }
+}
+
 /// In-memory keyed token-bucket limiter. The dispatcher applies it once to
 /// commands and callbacks before any persistent DB write.
 ///
@@ -106,13 +123,13 @@ impl CommandRateLimiter {
         }
     }
 
-    /// Returns `true` if the user may issue this command, `false` if they've
-    /// blown through their budget for the current window.
-    pub fn check(&self, user_id: UserId) -> bool {
+    /// Decides whether the user may issue this command now, and if not,
+    /// which budget rejected it.
+    pub fn check(&self, user_id: UserId) -> RateLimit {
         self.check_at(user_id, Instant::now())
     }
 
-    fn check_at(&self, user_id: UserId, now: Instant) -> bool {
+    fn check_at(&self, user_id: UserId, now: Instant) -> RateLimit {
         let mut state = self
             .state
             .lock()
@@ -124,7 +141,7 @@ impl CommandRateLimiter {
                 .retain(|_, budget| now.duration_since(budget.last_seen) < TRACKED_USER_TTL);
         }
         if !state.users.contains_key(&user_id) && state.users.len() >= MAX_TRACKED_USERS {
-            return false;
+            return RateLimit::SharedCeiling;
         }
 
         let global_tokens = state
@@ -135,16 +152,22 @@ impl CommandRateLimiter {
             last_seen: now,
         });
         let user_tokens = user.bucket.refilled_tokens(COMMANDS_PER_MINUTE, now);
-        let accepted = user_tokens >= 1.0 && global_tokens >= 1.0;
+        let decision = if user_tokens < 1.0 {
+            RateLimit::UserBudgetExhausted
+        } else if global_tokens < 1.0 {
+            RateLimit::SharedCeiling
+        } else {
+            RateLimit::Allowed
+        };
 
-        let consumed = if accepted { 1.0 } else { 0.0 };
+        let consumed = if decision.is_allowed() { 1.0 } else { 0.0 };
         user.bucket.tokens = user_tokens - consumed;
         user.bucket.last_refill = now;
         user.last_seen = now;
         state.global.tokens = global_tokens - consumed;
         state.global.last_refill = now;
 
-        accepted
+        decision
     }
 }
 
@@ -163,7 +186,7 @@ mod tests {
         let l = CommandRateLimiter::new();
         // Bucket starts full at COMMANDS_PER_MINUTE — that many in a row pass.
         for _ in 0..COMMANDS_PER_MINUTE {
-            assert!(l.check(42), "burst within quota");
+            assert!(l.check(42).is_allowed(), "burst within quota");
         }
     }
 
@@ -171,32 +194,35 @@ mod tests {
     fn rate_limiter_blocks_after_burst() {
         let l = CommandRateLimiter::new();
         for _ in 0..COMMANDS_PER_MINUTE {
-            assert!(l.check(7));
+            assert!(l.check(7).is_allowed());
         }
         // The next command in the same instant must fail.
-        assert!(!l.check(7), "post-burst request blocked");
+        assert!(!l.check(7).is_allowed(), "post-burst request blocked");
     }
 
     #[test]
     fn rate_limiter_is_per_user() {
         let l = CommandRateLimiter::new();
         for _ in 0..COMMANDS_PER_MINUTE {
-            assert!(l.check(1));
+            assert!(l.check(1).is_allowed());
         }
-        assert!(!l.check(1), "user 1 exhausted");
-        assert!(l.check(2), "user 2 still has full budget");
+        assert!(!l.check(1).is_allowed(), "user 1 exhausted");
+        assert!(l.check(2).is_allowed(), "user 2 still has full budget");
     }
 
     #[test]
     fn one_user_cannot_exhaust_other_users_budget() {
         let l = CommandRateLimiter::new();
         for _ in 0..COMMANDS_PER_MINUTE {
-            assert!(l.check(7));
+            assert!(l.check(7).is_allowed());
         }
         for _ in 0..256 {
-            assert!(!l.check(7));
+            assert!(!l.check(7).is_allowed());
         }
-        assert!(l.check(8), "another user must retain an independent budget");
+        assert!(
+            l.check(8).is_allowed(),
+            "another user must retain an independent budget"
+        );
     }
 
     #[test]
@@ -206,7 +232,7 @@ mod tests {
             let _ = l.check(user_id as i64);
         }
 
-        assert!(!l.check(MAX_TRACKED_USERS as i64));
+        assert!(!l.check(MAX_TRACKED_USERS as i64).is_allowed());
         assert_eq!(
             l.state.lock().unwrap().users.len(),
             MAX_TRACKED_USERS,
@@ -221,11 +247,13 @@ mod tests {
         let now = Instant::now();
         for user_id in 0..GLOBAL_COMMANDS_PER_MINUTE {
             assert!(
-                l.check_at(i64::from(user_id), now),
+                l.check_at(i64::from(user_id), now).is_allowed(),
                 "global burst within quota"
             );
         }
-        assert!(!l.check_at(i64::from(GLOBAL_COMMANDS_PER_MINUTE), now));
+        assert!(!l
+            .check_at(i64::from(GLOBAL_COMMANDS_PER_MINUTE), now)
+            .is_allowed());
     }
 
     #[test]
@@ -233,7 +261,7 @@ mod tests {
         let limiter = CommandRateLimiter::new();
         let now = Instant::now();
         for user_id in 0..GLOBAL_COMMANDS_PER_MINUTE {
-            assert!(limiter.check_at(i64::from(user_id), now));
+            assert!(limiter.check_at(i64::from(user_id), now).is_allowed());
         }
         let expired = now - TRACKED_USER_TTL - Duration::from_secs(1);
         limiter
@@ -244,7 +272,7 @@ mod tests {
             .get_mut(&0)
             .unwrap()
             .last_seen = expired;
-        assert!(!limiter.check_at(0, now));
+        assert!(!limiter.check_at(0, now).is_allowed());
         assert!(
             limiter.state.lock().unwrap().users[&0].last_seen > expired,
             "a rejected access must retain its tracking entry"
@@ -260,12 +288,45 @@ mod tests {
         let limiter = CommandRateLimiter::new();
         let now = Instant::now();
         for user_id in 0..GLOBAL_COMMANDS_PER_MINUTE {
-            assert!(limiter.check_at(i64::from(user_id), now));
+            assert!(limiter.check_at(i64::from(user_id), now).is_allowed());
         }
         for _ in 0..COMMANDS_PER_MINUTE {
-            assert!(!limiter.check_at(0, now));
+            assert!(!limiter.check_at(0, now).is_allowed());
         }
 
-        assert!(limiter.check_at(0, now + Duration::from_millis(500)));
+        assert!(limiter
+            .check_at(0, now + Duration::from_millis(500))
+            .is_allowed());
+    }
+
+    #[test]
+    fn rejections_name_the_budget_that_ran_out() {
+        let l = CommandRateLimiter::new();
+        let now = Instant::now();
+        for _ in 0..COMMANDS_PER_MINUTE {
+            assert!(l.check_at(7, now).is_allowed());
+        }
+        assert_eq!(l.check_at(7, now), RateLimit::UserBudgetExhausted);
+
+        for user_id in 8..i64::from(GLOBAL_COMMANDS_PER_MINUTE) + 2 {
+            let _ = l.check_at(user_id, now);
+        }
+        assert_eq!(
+            l.check_at(i64::from(GLOBAL_COMMANDS_PER_MINUTE) + 2, now),
+            RateLimit::SharedCeiling
+        );
+    }
+
+    #[test]
+    fn identity_ceiling_rejections_are_shared() {
+        let l = CommandRateLimiter::new();
+        let now = Instant::now();
+        for user_id in 0..MAX_TRACKED_USERS {
+            let _ = l.check_at(user_id as i64, now);
+        }
+        assert_eq!(
+            l.check_at(MAX_TRACKED_USERS as i64, now),
+            RateLimit::SharedCeiling
+        );
     }
 }
