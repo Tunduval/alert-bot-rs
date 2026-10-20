@@ -8,8 +8,8 @@
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::postgres::{PgConnection, PgPoolOptions, PgRow};
+use sqlx::{Connection, PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 
 use botcore::{Alert, AlertScope, AlertState, ChatType, Language, NewAlert, Schedule, User};
@@ -103,6 +103,16 @@ pub struct PgStore {
 
 impl PgStore {
     pub async fn connect(url: &str, max_connections: u32) -> Result<Self> {
+        // Fail fast with the specific version error at startup. The pool hook
+        // repeats the same check so reconnects and failovers cannot bypass it.
+        let mut preflight = PgConnection::connect(url).await?;
+        let version_num: i32 =
+            sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&mut preflight)
+                .await?;
+        server_version::require_supported(version_num)?;
+        preflight.close().await?;
+
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             // Ping every connection before handing it out. Cheap (single
