@@ -42,6 +42,7 @@ class LogsScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         # A developer's scripts/local.env may set LXC_HOST, so the host is not
         # checked. Only the remote command carries the validated values.
+        self.assertIsNotNone(arguments, "ssh was not called")
         self.assertEqual(len(arguments), 3)
         self.assertEqual(arguments[0], "-t")
         self.assertEqual(
