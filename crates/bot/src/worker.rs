@@ -12,8 +12,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgListener;
+use sqlx::postgres::{PgListener, PgNotification};
 use teloxide::prelude::*;
 use teloxide::ApiError;
 use tokio_util::sync::CancellationToken;
@@ -60,7 +61,8 @@ pub async fn run(bot: Bot, store: Arc<PgStore>, shutdown: CancellationToken) -> 
                 info!("worker shutting down");
                 return Ok(());
             }
-            _ = listener.recv() => {
+            notification = listener.recv() => {
+                require_notification(notification)?;
                 debug!("worker woke on NOTIFY");
             }
             _ = sleep_until(next_wake) => {
@@ -250,6 +252,12 @@ async fn reaper_loop(store: Arc<PgStore>, shutdown: CancellationToken) {
     }
 }
 
+fn require_notification(notification: Result<PgNotification, sqlx::Error>) -> anyhow::Result<()> {
+    notification
+        .map(|_| ())
+        .context("receiving alerts_changed notification")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +330,13 @@ mod tests {
         );
         server.abort();
         store.pool().close().await;
+    }
+
+    #[test]
+    fn listener_errors_stop_the_worker_instead_of_spinning() {
+        let error = require_notification(Err(sqlx::Error::PoolClosed)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("receiving alerts_changed notification"));
     }
 }
