@@ -153,7 +153,7 @@ sudo -u postgres createdb -O alertbot alertbot
 # are cluster-wide. The query must return no unexpected non-superuser login
 # roles. Isolate every result in another cluster before continuing.
 sudo -u postgres psql --dbname alertbot --command \
-  "SELECT rolname, rolconnlimit FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND rolname <> 'alertbot';"
+  "SELECT rolname, rolconnlimit FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND rolname NOT IN ('alertbot', 'alertbot-backup');"
 
 # Bound service connections and remove write-like primitives from every
 # ordinary login in this database. The app keeps only the session and
@@ -208,18 +208,18 @@ sudo -u postgres psql --dbname alertbot --command \
 
 Put these rules before every generic `local` or `host` rule in
 `/etc/postgresql/<major>/main/pg_hba.conf`. PostgreSQL uses the first matching
-rule. The local rule lets the service identity enter only the application
+rule. The local rules let both service identities enter only the application
 database. The host rules reject IPv4 and IPv6 TCP connections before a later
 password rule could accept them:
 
 ```text
-local   alertbot   alertbot   peer
-local   all        alertbot   reject
-host    all        alertbot   0.0.0.0/0   reject
-host    all        alertbot   ::0/0       reject
+local   alertbot   alertbot,alertbot-backup   peer
+local   all        alertbot,alertbot-backup   reject
+host    all        alertbot,alertbot-backup   0.0.0.0/0   reject
+host    all        alertbot,alertbot-backup   ::0/0       reject
 ```
 
-Do not add another `local` or `host` rule for this role. A PostgreSQL login
+Do not add another `local` or `host` rule for these roles. A PostgreSQL login
 role can set its own password. The explicit host rejects therefore remain
 required even though this deployment neither sets nor stores database
 passwords. A later generic password rule must not become an alternative path.
@@ -248,9 +248,9 @@ sudo -u alertbot psql -d alertbot -c "SELECT count(*) FROM pg_tables WHERE schem
 ```
 
 The app role owns the application database and keeps `TEMPORARY` plus only the
-three advisory-lock functions listed above. Peer authentication via the Unix
-socket binds the database identity to its matching system user without a
-stored password.
+three advisory-lock functions listed above. The backup role receives only the
+separate read grants in step 8. Peer authentication via the Unix socket binds
+each database identity to its matching system user without a stored password.
 
 #### 3. Install the systemd unit + config file
 
@@ -349,25 +349,51 @@ should be `0`.
 
 #### 6. Migrate data from the old host (skip if starting fresh)
 
+Use a new LXC with the empty `alertbot` database and access controls from
+steps 1–3. Do not start its bot or enable its backup timer before the restore.
+Keep the old database for rollback. An archive from an older schema must not
+be restored over a newer schema: foreign keys from tables absent in the
+archive can prevent `pg_restore --clean` from removing older objects.
+
 On the source machine (old docker-on-LXC setup):
 
 ```bash
 docker compose stop bot
 docker compose exec -T postgres \
-    pg_dump -U alertbot --clean --if-exists --no-owner --no-privileges alertbot \
-    > alertbot.sql
-scp alertbot.sql root@<new-lxc-ip>:/tmp/
+    pg_dump -U alertbot --format=custom --no-owner --no-privileges --no-blobs alertbot \
+    > alertbot-migration.dump
+scp alertbot-migration.dump root@<new-lxc-ip>:/root/alertbot-migration.dump
 ```
 
 On the new LXC:
 
 ```bash
+set -euo pipefail
+migration=/root/alertbot-migration.dump
+test -f "$migration"
+test ! -L "$migration"
+chmod 0600 "$migration"
+target_tables=$(sudo -u alertbot psql -XAt -v ON_ERROR_STOP=1 -d alertbot \
+    -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','v','m','S','f');")
+[[ "$target_tables" == 0 ]] || { echo 'Restore requires an empty replacement database' >&2; exit 1; }
 systemctl stop alert-bot
-sudo -u postgres psql -d alertbot < /tmp/alertbot.sql
-sudo -u postgres psql -d alertbot \
+cleanup_migration() {
+    rm -f -- "$migration"
+}
+trap cleanup_migration EXIT
+sudo -u alertbot pg_restore --exit-on-error --single-transaction \
+    --no-owner --no-privileges \
+    --dbname=alertbot < "$migration"
+sudo -u alertbot psql -d alertbot \
     -c "SELECT count(*), max(created_at) FROM alerts;"
-systemctl start alert-bot
+cleanup_migration
+trap - EXIT
 ```
+
+Continue with step 4. The first start applies the missing migrations to the
+restored database. Verify its startup and reminder data before changing the
+tunnel route. Keep the old bot stopped so only one instance sends reminders.
+If migration fails, the new bot stays stopped and the old database is intact.
 
 #### 7. Cloudflare Access SSH for CI deploys
 
@@ -409,42 +435,282 @@ deployment via Cloudflare Access. There is no GitHub Release step.
 
 #### 8. Nightly off-site backup → Netcup SFTP
 
-```bash
-apt install -y curl sshpass postgresql-client
+Generate the `age` identity on a separate trusted offline system:
 
+```bash
+umask 077
+age-keygen -o alertbot-backup.agekey
+age-keygen -y alertbot-backup.agekey > alertbot-backup-recipient.txt
+```
+
+Store `alertbot-backup.agekey` offline. Copy only the single `age1...`
+recipient from `alertbot-backup-recipient.txt` into
+`BACKUP_AGE_RECIPIENT` below. The identity must never reside on the production
+LXC.
+
+Configure the production LXC:
+
+```bash
+apt install -y age curl openssl sshpass postgresql-client-16
+pg_dump --version  # must report at least 16.15
+
+# Keep backup credentials outside the bot's Unix identity.
+useradd --system --no-create-home --shell /usr/sbin/nologin alertbot-backup
+sudo -u postgres createuser --no-createdb --no-createrole --no-superuser \
+  --connection-limit=1 alertbot-backup
+sudo -u postgres psql -v ON_ERROR_STOP=1 --dbname alertbot <<'SQL'
+ALTER ROLE "alertbot-backup" SET temp_file_limit = '256MB';
+GRANT CONNECT ON DATABASE alertbot TO "alertbot-backup";
+GRANT USAGE ON SCHEMA public TO "alertbot-backup";
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO "alertbot-backup";
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO "alertbot-backup";
+SQL
+sudo -u alertbot psql -v ON_ERROR_STOP=1 --dbname alertbot <<'SQL'
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT ON TABLES TO "alertbot-backup";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT ON SEQUENCES TO "alertbot-backup";
+SQL
+
+# Confirm peer authentication and the narrowly scoped read access.
+sudo -u alertbot-backup psql -v ON_ERROR_STOP=1 --dbname alertbot \
+  --command 'SELECT count(*) FROM alerts;'
+# The backup identity must not reach another database or write persistent
+# large objects, temporary tables, or advisory locks. Every check must fail.
+! sudo -u alertbot-backup psql --dbname postgres --command 'SELECT 1;'
+! sudo -u alertbot-backup psql \
+  "hostaddr=127.0.0.1 dbname=alertbot user=alertbot-backup connect_timeout=2" \
+  --command 'SELECT 1;'
+! sudo -u alertbot-backup psql \
+  "hostaddr=::1 dbname=alertbot user=alertbot-backup connect_timeout=2" \
+  --command 'SELECT 1;'
+! sudo -u alertbot-backup psql --dbname alertbot --command 'SELECT lo_create(0);'
+! sudo -u alertbot-backup psql --dbname alertbot \
+  --command 'CREATE TEMPORARY TABLE privilege_probe(value integer);'
+! sudo -u alertbot-backup psql --dbname alertbot \
+  --command 'SELECT pg_try_advisory_lock(1);'
+
+# Existing installations should return no rows here. Review unexpected objects
+# before removing them with lo_unlink; --no-blobs keeps them out of backups but
+# does not reclaim their primary-database storage.
+sudo -u postgres psql --dbname alertbot --command \
+  'SELECT oid, pg_get_userbyid(lomowner) AS owner FROM pg_largeobject_metadata;'
+
+ssh-keyscan -t ed25519 yourhost.netcup.net \
+  > /etc/alertbot-backup-known-hosts
+ssh-keygen -lf /etc/alertbot-backup-known-hosts
+# Compare this fingerprint with the provider's value over a separate,
+# trusted channel before continuing.
+chown root:root /etc/alertbot-backup-known-hosts
+chmod 0644 /etc/alertbot-backup-known-hosts
+
+install -o root -g root -m 0600 /dev/null /etc/alertbot-backup.env
 cat > /etc/alertbot-backup.env <<EOF
 BACKUP_NETCUP_HOST=yourhost.netcup.net
 BACKUP_NETCUP_USER=<sftp user>
 BACKUP_NETCUP_PASS=<sftp password>
 BACKUP_NETCUP_PATH=backups/alertbot
+BACKUP_KNOWN_HOSTS=/etc/alertbot-backup-known-hosts
+BACKUP_AGE_RECIPIENT=<age1 recipient generated offline>
 RETENTION_DAYS=30
 EOF
-chmod 600 /etc/alertbot-backup.env
+
+# Keep the private signing key root-only. systemd exposes it only to the
+# dedicated backup service through LoadCredential. Keep the public verification
+# key under the separate restore trust path.
+umask 077
+install -o root -g root -m 0700 -d /etc/alertbot-backup
+install -o root -g root -m 0755 -d /etc/alertbot-restore
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+  -out /etc/alertbot-backup/signing-private.pem
+openssl pkey -in /etc/alertbot-backup/signing-private.pem -pubout \
+  -out /etc/alertbot-restore/signing-public.pem
+chown root:root /etc/alertbot-backup/signing-private.pem \
+  /etc/alertbot-restore/signing-public.pem
+chmod 0600 /etc/alertbot-backup/signing-private.pem
+chmod 0644 /etc/alertbot-restore/signing-public.pem
 
 systemctl daemon-reload
 systemctl enable --now alertbot-backup.timer
 systemctl start alertbot-backup.service        # test now
 journalctl -u alertbot-backup -n 30
+! systemctl is-failed --quiet alertbot-backup.service
 ```
 
-Daily from 03:30 UTC (up to 15 minutes randomized delay), the timer streams a
-gzipped `pg_dump` to Netcup as `.part`. A separate rename publishes the final
-filename only after dump, compression and upload have all succeeded. The script
-prunes matching final dumps older than `RETENTION_DAYS` on the remote side.
+`BACKUP_NETCUP_PATH` names an absolute directory inside the SFTP server's
+visible filesystem, with the leading slash omitted in the configuration.
+Upload, rename, retention, and the restore URLs below all use
+`/backups/alertbot`, regardless of the SFTP account's initial directory.
+
+Daily from 03:30 UTC, with up to 15 minutes randomized delay, the timer creates
+a PostgreSQL custom-format dump in a service-private, mode-0700 temporary
+directory. It encrypts the dump with `age` and deletes the plaintext
+immediately. The script creates a
+manifest for the encrypted `.dump.age` file. The manifest binds the format
+version, database, canonical file name, UTC creation time, ciphertext byte
+size, and SHA-256 hash. It signs that manifest with RSA. It uploads only the
+ciphertext, manifest, and detached signature as `.part` files. Separate renames
+publish the signature, manifest, and ciphertext in that order. The script
+limits a retention listing to 60 seconds and 1 MiB. It prunes every matching
+backup part after `RETENTION_DAYS`, including the unencrypted `.sql.gz` dumps
+of earlier versions. Uploads, renames, and retention accept only the host keys
+in `BACKUP_KNOWN_HOSTS`.
+
+The backup host must provide `pg_dump` 16.15 or newer in major 16, 17.11 or
+newer in major 17, or 18.6 or newer in major 18. The script rejects older and
+unknown major versions before it reads the database. These floors contain the
+official fix for
+[CVE-2026-19385](https://www.postgresql.org/support/security/CVE-2026-19385/),
+which otherwise lets a crafted database object execute code in `pg_dump`.
+
+The unit runs as `alertbot-backup`. PostgreSQL peer authentication maps that
+Unix account to the matching database role. That role has only `CONNECT`,
+schema `USAGE`, and `SELECT` grants; it cannot assume the application owner.
+It has one connection slot, cannot enter another database, cannot acquire the
+application's advisory locks, and cannot create temporary tables or PostgreSQL
+large objects.
+The dump excludes large objects because this application does not use them.
+The `postgres` superuser is not required while a backup runs. Provisioning the
+role and its access controls still requires an administrator. The bot's Unix
+account cannot read the SFTP environment file or private signing key.
 
 ### Restoring from backup
 
+Restore on a replacement LXC with a dedicated, empty `alertbot` database.
+Complete steps 1–3 only. Do not run step 4 yet: it starts the bot, which
+would migrate the database before restoration.
+Do not run step 8 yet. Keep the current database untouched for rollback.
+Use the same database name so the documented peer-authentication rules still
+apply. The empty-target check below rejects an already migrated database.
+
+Obtain the existing restore public key and SFTP host key from their
+independently trusted backup. Install that public key as root-owned
+`/etc/alertbot-restore/signing-public.pem` and the verified host key as
+root-owned `/etc/alertbot-backup-known-hosts`. Do not create a new signing key
+for verification: it cannot authenticate existing backups. Do not obtain the
+public key from the SFTP archive directory.
+
 ```bash
+set -euo pipefail
+restore_dir=$(mktemp -d /root/alertbot-restore.XXXXXX)
+identity_mount=/media/alertbot-age
+cleanup_restore() {
+    local cleanup_status=$?
+    if mountpoint -q "$identity_mount"; then
+        umount "$identity_mount" || true
+    fi
+    rm -rf -- "$restore_dir" || true
+    return "$cleanup_status"
+}
+trap cleanup_restore EXIT
+backup_name=alertbot-2026-05-09T033000Z.dump.age
+[[ "$backup_name" =~ ^alertbot-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z\.dump\.age$ ]]
+ciphertext="$restore_dir/$backup_name"
+backup="$restore_dir/${backup_name%.age}"
+manifest="$ciphertext.manifest"
+signature="$manifest.sig"
+# curl reads SFTP host keys only from $HOME/.ssh/known_hosts and rejects
+# every key that is not listed there.
+curl_home="$restore_dir/curl-home"
+install -d -m 0700 "$curl_home" "$curl_home/.ssh"
+install -m 0600 /etc/alertbot-backup-known-hosts "$curl_home/.ssh/known_hosts"
+
+read -r -p 'SFTP user: ' BACKUP_NETCUP_USER
+HOME="$curl_home" curl --fail --show-error --silent \
+    --connect-timeout 15 --max-time 60 --max-filesize 4096 \
+    --user "$BACKUP_NETCUP_USER" \
+    --output "$manifest" \
+    "sftp://yourhost.netcup.net/backups/alertbot/$backup_name.manifest"
+HOME="$curl_home" curl --fail --show-error --silent \
+    --connect-timeout 15 --max-time 60 --max-filesize 16384 \
+    --user "$BACKUP_NETCUP_USER" \
+    --output "$signature" \
+    "sftp://yourhost.netcup.net/backups/alertbot/$backup_name.manifest.sig"
+
+# Trust metadata only after the pinned restore key verifies its signature.
+openssl dgst -sha256 -verify /etc/alertbot-restore/signing-public.pem \
+  -signature "$signature" "$manifest"
+mapfile -t metadata < "$manifest"
+(( ${#metadata[@]} == 6 ))
+[[ "${metadata[0]}" == "format_version=2" ]]
+[[ "${metadata[1]}" == database=* ]]
+[[ "${metadata[2]}" == filename=* ]]
+[[ "${metadata[3]}" == created_at=* ]]
+[[ "${metadata[4]}" == size_bytes=* ]]
+[[ "${metadata[5]}" == sha256=* ]]
+manifest_database=${metadata[1]#database=}
+manifest_filename=${metadata[2]#filename=}
+manifest_created_at=${metadata[3]#created_at=}
+manifest_size=${metadata[4]#size_bytes=}
+manifest_sha256=${metadata[5]#sha256=}
+[[ "$manifest_database" == alertbot ]]
+[[ "$manifest_filename" == "$backup_name" ]]
+[[ "$manifest_created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z$ ]]
+[[ "$manifest_filename" == "alertbot-${manifest_created_at}.dump.age" ]]
+[[ "$manifest_size" =~ ^[0-9]+$ ]] && (( manifest_size <= 1073741824 ))
+[[ "$manifest_sha256" =~ ^[0-9a-f]{64}$ ]]
+
+HOME="$curl_home" curl --fail --show-error --silent \
+    --connect-timeout 15 --max-time 1800 --max-filesize 1073741824 \
+    --user "$BACKUP_NETCUP_USER" \
+    --output "$ciphertext" \
+    "sftp://yourhost.netcup.net/backups/alertbot/$backup_name"
+actual_size=$(stat -c %s "$ciphertext")
+actual_sha256=$(sha256sum "$ciphertext")
+actual_sha256=${actual_sha256%% *}
+[[ "$actual_size" == "$manifest_size" ]]
+[[ "$actual_sha256" == "$manifest_sha256" ]]
+
+# Attach the offline identity on read-only removable media only for this step.
+age_identity="$identity_mount/alertbot-backup.agekey"
+mountpoint -q "$identity_mount"
+findmnt -no OPTIONS "$identity_mount" | tr ',' '\n' | grep -qx ro
+[[ -r "$age_identity" ]]
+age --decrypt --identity "$age_identity" --output "$backup" "$ciphertext"
+unset age_identity
+umount "$identity_mount"
+# Remove the media before you continue. A failed decrypt exits before this
+# point, so it cannot stop the bot or touch the database.
+read -r -p 'Offline identity media removed? [y/N] ' media_removed
+[[ "$media_removed" == y ]]
+unset media_removed
+
+target_tables=$(sudo -u alertbot psql -XAt -v ON_ERROR_STOP=1 -d alertbot \
+    -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','v','m','S','f');")
+[[ "$target_tables" == 0 ]] || { echo 'Restore requires an empty replacement database' >&2; exit 1; }
 systemctl stop alert-bot
-curl --user "$BACKUP_NETCUP_USER:$BACKUP_NETCUP_PASS" \
-    "sftp://your-netcup-host/backups/alertbot/alertbot-2026-05-09T033000Z.sql.gz" \
-  | gunzip \
-  | sudo -u postgres psql -d alertbot
-systemctl start alert-bot
+sudo -u alertbot pg_restore \
+  --exit-on-error --single-transaction \
+  --no-owner --no-privileges --dbname=alertbot < "$backup"
+sudo -u alertbot psql -X -v ON_ERROR_STOP=1 -d alertbot \
+  -c "SELECT count(*), max(created_at) FROM alerts;"
+cleanup_restore
+trap - EXIT
 ```
 
-`pg_dump --clean --if-exists` drops and recreates backed-up objects. Restoring
-replaces their current data; first preserve any data you still need.
+Never restore a dump without its signed manifest. Never use a public key
+downloaded beside the backup. Only the pinned key under `/etc/alertbot-restore`
+authenticates the manifest. Its file name, database, byte size, and hash checks
+reject renamed or manipulated ciphertext before decryption. `age` decrypts the
+verified ciphertext into the root-only temporary directory before the bot
+stops. A failed signature, hash check, or decryption leaves the database and bot
+untouched. Keep the `age` identity offline. Attach its read-only removable media
+only for a manual restore, unmount it immediately after decryption, and never
+copy it onto the production LXC.
+
+`pg_restore` creates the backed-up objects in the empty database. It runs as
+the application owner, not as the PostgreSQL superuser. The root shell opens
+the verified, root-only archive and passes it
+through standard input, so the database user never needs access to `/root`.
+After restoration, stop the previous bot through its management connection.
+Then complete step 4 on the replacement: it installs the binary and starts
+the bot, which applies any missing migrations. Check startup, database
+contents, and the webhook configuration before switching the tunnel route.
+Only then provision the backup role and timer from step 8. Keep the previous
+instance stopped but retain its database until the replacement is accepted.
+If restoration fails, the
+cleanup trap removes the downloaded files and leaves the bot stopped. Check
+the replacement database before retrying; do not erase the previous instance.
 
 ## Update workflow (CI/CD)
 
