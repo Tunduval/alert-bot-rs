@@ -4,6 +4,8 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+[workspace]
+
 [[bin]]
 name = "ci-env-canary"
 path = "src/main.rs"
