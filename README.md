@@ -490,9 +490,12 @@ crates/
 ```
 
 - **HTTP boundary** accepts at most 64 simultaneous TCP connections. It allows
-  five seconds, 32 fields, and an 8 KiB buffer for request headers. Webhook and
-  stats use the same bounded server, so an unauthenticated Slowloris client
-  cannot hold the process's file descriptors indefinitely.
+  five seconds, 32 fields, and an 8 KiB buffer for request headers. Each
+  connection lives at most 60 seconds; after that the server finishes the
+  request in flight, waits up to five seconds, and closes it. Webhook and stats
+  use the same bounded server, so an unauthenticated Slowloris client or a
+  client that never reads its responses cannot hold the process's file
+  descriptors indefinitely.
 - **Webhook** verifies the Telegram secret before reading the body. It accepts
   at most 64 KiB within five seconds and queues at most 128 updates. A full
   queue returns HTTP 429 so Telegram applies backpressure. Invalid or future

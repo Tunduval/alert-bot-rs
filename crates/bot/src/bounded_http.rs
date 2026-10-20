@@ -1,4 +1,4 @@
-//! Small HTTP/1 server with hard connection and header-reading bounds.
+//! Small HTTP/1 server with hard connection, lifetime and header-reading bounds.
 
 use std::{future::Future, sync::Arc, time::Duration};
 
@@ -22,6 +22,19 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+// A client that pipelines requests and never reads the responses blocks the
+// server in write, and one that reads a few bytes at a time keeps a write
+// timeout from firing. Only a deadline on the whole connection frees the slot
+// in both cases. Telegram reconnects without trouble, so a busy keep-alive
+// connection is closed gracefully once the lifetime is up.
+#[cfg(not(test))]
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const CONNECTION_LIFETIME: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
 pub(crate) async fn serve<F>(
@@ -82,6 +95,8 @@ where
                         TowerToHyperService::new(app),
                     );
                     tokio::pin!(connection);
+                    let lifetime = tokio::time::sleep(CONNECTION_LIFETIME);
+                    tokio::pin!(lifetime);
 
                     tokio::select! {
                         result = connection.as_mut() => {
@@ -94,6 +109,20 @@ where
                                 connection.as_mut().graceful_shutdown();
                                 if let Err(error) = connection.await {
                                     tracing::debug!(%peer, %error, "closed HTTP connection during shutdown");
+                                }
+                            }
+                        }
+                        _ = &mut lifetime => {
+                            // Let a request in flight finish, then drop the
+                            // connection even if a client stalls the write.
+                            connection.as_mut().graceful_shutdown();
+                            match tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT, connection).await {
+                                Ok(Err(error)) => {
+                                    tracing::debug!(%peer, %error, "closed HTTP connection at its lifetime");
+                                }
+                                Ok(Ok(())) => {}
+                                Err(_) => {
+                                    tracing::debug!(%peer, "dropped HTTP connection at its lifetime");
                                 }
                             }
                         }
@@ -145,10 +174,15 @@ mod tests {
     use super::*;
 
     async fn test_server() -> (SocketAddr, oneshot::Sender<()>, JoinHandle<Result<()>>) {
+        test_server_with(Router::new().route("/", post(|| async { StatusCode::NO_CONTENT }))).await
+    }
+
+    async fn test_server_with(
+        app: Router,
+    ) -> (SocketAddr, oneshot::Sender<()>, JoinHandle<Result<()>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let app = Router::new().route("/", post(|| async { StatusCode::NO_CONTENT }));
         let server = tokio::spawn(serve(listener, app, async move {
             let _ = shutdown_rx.await;
         }));
@@ -255,6 +289,55 @@ mod tests {
             .await
             .unwrap();
 
+        stop_server(shutdown, server).await;
+    }
+
+    /// Whether a fresh connection gets a response, i.e. a slot is free.
+    async fn probe(address: SocketAddr) -> bool {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0_u8; 12];
+        matches!(
+            tokio::time::timeout(Duration::from_millis(100), stream.read_exact(&mut head)).await,
+            Ok(Ok(_))
+        ) && &head == b"HTTP/1.1 200"
+    }
+
+    #[tokio::test]
+    async fn frees_slots_held_by_clients_that_never_read_responses() {
+        // Each response is far larger than the socket buffers, so a client
+        // that pipelines requests and never reads blocks the server in write.
+        let app = Router::new().route("/", post(|| async { vec![b'x'; 64 * 1024] }));
+        let (address, shutdown, server) = test_server_with(app).await;
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+        let mut slow_readers = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_recv_buffer_size(4096).unwrap();
+            let mut stream = socket.connect(address).await.unwrap();
+            stream.write_all(&request.repeat(100)).await.unwrap();
+            slow_readers.push(stream);
+        }
+        assert!(
+            !probe(address).await,
+            "slow readers must occupy every connection slot"
+        );
+
+        let freed = tokio::time::timeout(Duration::from_secs(3), async {
+            while !probe(address).await {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            freed.is_ok(),
+            "the connection lifetime must free slots held by slow readers"
+        );
+
+        drop(slow_readers);
         stop_server(shutdown, server).await;
     }
 
