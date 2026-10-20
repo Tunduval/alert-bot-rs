@@ -9,8 +9,8 @@
 //! absolute date (`30.4.26`, `2026-04-30`) → bare clock-time (`22:00`) →
 //! named day (`morgen`, `do`).
 //!
-//! Fuzzy matching applies to keywords only (weekdays, "morgen", "uhr", longform
-//! units). Numbers and the reminder text are never fuzzy-matched.
+//! Fuzzy matching applies to keywords only (weekdays, "morgen", "uhr").
+//! Numbers, longform units and the reminder text are never fuzzy-matched.
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -436,6 +436,19 @@ mod tests {
     fn bare_clock_hour_only() {
         let r = p("14 Uhr text");
         assert_eq!(r.fire_at(), local(2026, 5, 8, 14, 0));
+    }
+
+    #[test]
+    fn bare_hour_keeps_a_following_word_that_resembles_a_unit() {
+        let r = p("9 Kunden anrufen");
+        assert_eq!(r.fire_at(), local(2026, 5, 9, 9, 0));
+        assert_eq!(r.text, "Kunden anrufen");
+        let r = p("14 Lage besprechen");
+        assert_eq!(r.fire_at(), local(2026, 5, 8, 14, 0));
+        assert_eq!(r.text, "Lage besprechen");
+        let r = p_en("8 take vitamins");
+        assert_eq!(r.fire_at(), local(2026, 5, 9, 8, 0));
+        assert_eq!(r.text, "take vitamins");
     }
 
     #[test]

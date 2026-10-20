@@ -7,8 +7,8 @@
 //!   thing — use `Y`). Only the seven characters listed in `compact_unit`
 //!   are valid.
 //! - **Longforms** — whole-word units like `minuten`, `stunden`, `monate`.
-//!   Case-insensitive, fuzzy via Levenshtein, used as a separate token after
-//!   a number (`30 minuten`). Not used inside combined REL specs.
+//!   Case-insensitive exact matches, used as a separate token after a number
+//!   (`30 minuten`). Not used inside combined REL specs.
 //!
 //! All other matchers (named days, "uhr", "in", "at", recurring keywords)
 //! are case-insensitive whole-token matches.
@@ -131,7 +131,8 @@ pub fn compact_unit(c: char) -> Option<TimeUnit> {
 
 // ---------------------------------------------------------------------------
 // Longforms: whole-word units after a number (`30 minuten`).
-// Case-insensitive, fuzzy.
+// Case-insensitive, exact: a fuzzy match would read reminder words after a
+// bare hour as units (`9 Kunden` → `9 sekunden`, `8 take` → `8 tage`).
 // ---------------------------------------------------------------------------
 
 const LONGFORM_TABLE: &[(TimeUnit, &[&str])] = &[
@@ -155,7 +156,10 @@ const LONGFORM_TABLE: &[(TimeUnit, &[&str])] = &[
 
 pub fn match_longform_unit(token: &str) -> Option<TimeUnit> {
     let lower = token.to_lowercase();
-    best_fuzzy(&lower, LONGFORM_TABLE)
+    LONGFORM_TABLE
+        .iter()
+        .find(|(_, aliases)| aliases.contains(&lower.as_str()))
+        .map(|(unit, _)| *unit)
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +247,15 @@ mod tests {
         assert_eq!(match_longform_unit("jahre"), Some(TimeUnit::Year));
         // single-char "m" is *not* a longform — that's the compact path.
         assert_eq!(match_longform_unit("m"), None);
+    }
+
+    #[test]
+    fn longform_units_reject_near_misses() {
+        assert_eq!(match_longform_unit("kunden"), None);
+        assert_eq!(match_longform_unit("lage"), None);
+        assert_eq!(match_longform_unit("socken"), None);
+        assert_eq!(match_longform_unit("take"), None);
+        assert_eq!(match_longform_unit("gear"), None);
     }
 
     #[test]
