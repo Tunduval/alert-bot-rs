@@ -90,12 +90,14 @@ pub async fn start(
         let server_result = crate::bounded_http::serve(tcp_listener, app, stop_flag)
             .await
             .context("serving webhook requests");
-        let delete_result =
-            tokio::time::timeout(WEBHOOK_DELETE_TIMEOUT, bot.delete_webhook().send())
-                .await
-                .context("timed out deleting Telegram webhook")?
-                .context("deleting Telegram webhook");
-        server_result.and(delete_result.map(|_| ()))
+        // Telegram stops delivering to a dead endpoint on its own, so a failed
+        // delete must not turn a clean shutdown into a crash.
+        match tokio::time::timeout(WEBHOOK_DELETE_TIMEOUT, bot.delete_webhook().send()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "deleting Telegram webhook failed"),
+            Err(_) => tracing::warn!("timed out deleting Telegram webhook"),
+        }
+        server_result
     });
 
     Ok((
@@ -213,6 +215,54 @@ mod tests {
         format!(
             r#"{{"update_id":{id},"message":{{"message_id":1,"date":0,"chat":{{"id":1,"type":"private"}},"text":"/help"}}}}"#
         )
+    }
+
+    /// Start the listener against a fake Telegram API that answers
+    /// `deleteWebhook` with `delete_response` (`None` never answers) and
+    /// acknowledges every other method, then stop it.
+    async fn stop_listener(delete_response: Option<(StatusCode, &'static str)>) -> Result<()> {
+        let api = Router::new().fallback(move |request: Request| async move {
+            if !request.uri().path().ends_with("/DeleteWebhook") {
+                return (StatusCode::OK, r#"{"ok":true,"result":true}"#).into_response();
+            }
+            match delete_response {
+                Some(response) => response.into_response(),
+                None => std::future::pending().await,
+            }
+        });
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}/", api_listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        tokio::spawn(async move { axum::serve(api_listener, api).await.unwrap() });
+
+        let bot = Bot::new("123:test").set_api_url(api_url);
+        let (mut listener, server) = start(
+            bot,
+            "127.0.0.1:0".parse().unwrap(),
+            "https://example.test/hook".parse().unwrap(),
+            SECRET.to_owned(),
+        )
+        .await
+        .unwrap();
+        listener.stop_token().stop();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("webhook shutdown must be bounded")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shuts_down_cleanly_when_delete_webhook_fails() {
+        let failure = r#"{"ok":false,"error_code":400,"description":"Bad Request: test failure"}"#;
+        stop_listener(Some((StatusCode::BAD_REQUEST, failure)))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shuts_down_cleanly_when_delete_webhook_times_out() {
+        stop_listener(None).await.unwrap();
     }
 
     #[tokio::test]
