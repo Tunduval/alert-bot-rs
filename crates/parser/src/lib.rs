@@ -65,6 +65,9 @@ pub enum ParseNote {
     /// `*31.` — in months shorter than 31 days, the alert fires on the last
     /// day of the month.
     MonthlyLastDay,
+    /// `*NM` created on the 29th–31st — in shorter months, the alert fires
+    /// on the last day of the month.
+    MonthlyLastDayFrom { day: u8 },
     /// `*29.2` — in non-leap years, the alert fires on Feb 28.
     YearlyFeb29Fallback,
 }
@@ -190,6 +193,13 @@ mod tests {
             .with_ymd_and_hms(y, m, d, h, min, 0)
             .unwrap()
             .with_timezone(&Utc)
+    }
+    fn parse_at(input: &str, now_utc: DateTime<Utc>) -> Result<Parsed, ParseError> {
+        let ctx = ParseContext {
+            now_utc,
+            ..ctx(Language::De)
+        };
+        parse(input, &ctx)
     }
 
     // ---- Relative simple ----
@@ -320,6 +330,32 @@ mod tests {
     }
 
     #[test]
+    fn rel_subday_followed_by_number_keeps_number_as_text() {
+        let now = ctx(Language::De).now_utc;
+        for (input, offset, text) in [
+            (
+                "30m 2 Eier kochen",
+                chrono::Duration::minutes(30),
+                "2 Eier kochen",
+            ),
+            (
+                "1h 3 Mails beantworten",
+                chrono::Duration::hours(1),
+                "3 Mails beantworten",
+            ),
+            (
+                "in 10 minuten 4 Tabletten",
+                chrono::Duration::minutes(10),
+                "4 Tabletten",
+            ),
+        ] {
+            let r = p(input);
+            assert_eq!(r.text, text, "{input}");
+            assert_eq!(r.fire_at(), now + offset, "{input}");
+        }
+    }
+
+    #[test]
     fn rel_50_year_cap() {
         let e = err("100Y text");
         assert_eq!(e, ParseError::RelTooFar(MAX_RELATIVE_YEARS));
@@ -351,6 +387,16 @@ mod tests {
     fn abs_trailing_dot() {
         let r = p("30.4. Termin");
         assert_eq!(r.fire_at(), local(2027, 4, 30, 9, 0)); // past this year → next
+    }
+
+    #[test]
+    fn abs_no_year_today_with_time_passed_rolls_to_next_year() {
+        // Reference 2026-05-08 12:00: today's 09:00 default and an explicit
+        // 11:00 are past, so the next occurrence is next year.
+        assert_eq!(p("8.5 Termin").fire_at(), local(2027, 5, 8, 9, 0));
+        assert_eq!(p("8.5. 11:00 Termin").fire_at(), local(2027, 5, 8, 11, 0));
+        // Still ahead today → stays this year.
+        assert_eq!(p("8.5 15:00 Termin").fire_at(), local(2026, 5, 8, 15, 0));
     }
 
     #[test]
@@ -459,6 +505,14 @@ mod tests {
     fn named_weekday_default_time_passed_next_week() {
         let r = p("fr putzen");
         assert_eq!(r.fire_at(), local(2026, 5, 15, 9, 0));
+    }
+
+    #[test]
+    fn named_weekday_in_dst_gap_keeps_weekday_and_bumps_time() {
+        // Europe/Berlin springs forward on Sunday 2027-03-28: 02:30 does not
+        // exist. Sent on the Saturday before, `so 2:30` must stay on Sunday.
+        let r = parse_at("so 2:30 x", local(2027, 3, 27, 12, 0)).unwrap();
+        assert_eq!(r.fire_at(), local(2027, 3, 28, 3, 30));
     }
 
     #[test]
@@ -677,6 +731,33 @@ mod tests {
     }
 
     #[test]
+    fn rec_subday_followed_by_number_keeps_number_as_text() {
+        let r = p("*30m 2 Gläser Wasser");
+        assert_eq!(r.text, "2 Gläser Wasser");
+        assert!(rrule(&r).contains("FREQ=MINUTELY"));
+    }
+
+    #[test]
+    fn rec_subday_interval_is_exact_across_dst() {
+        // Europe/Berlin springs forward at 2027-03-28 01:00 UTC. Sub-day
+        // intervals must stay exactly N apart on the UTC timeline.
+        for (input, step) in [
+            ("*3h x", chrono::Duration::hours(3)),
+            ("*30m x", chrono::Duration::minutes(30)),
+        ] {
+            let now = local(2027, 3, 27, 22, 0);
+            let r = parse_at(input, now).unwrap();
+            let mut prev = r.fire_at();
+            assert_eq!(prev, now + step, "{input}");
+            for _ in 0..8 {
+                let next = r.schedule.next_after(prev).unwrap();
+                assert_eq!(next - prev, step, "{input}: {prev} -> {next}");
+                prev = next;
+            }
+        }
+    }
+
+    #[test]
     fn rec_weekly_single_day_long() {
         let r = p("jeden donnerstag 14:00 standup");
         let s = rrule(&r);
@@ -834,5 +915,41 @@ mod tests {
     #[test]
     fn rec_no_recognised_spec_after_keyword() {
         assert_eq!(err("every gibberish"), ParseError::NoTimeExpression);
+    }
+
+    fn p_at(input: &str, y: i32, m: u32, d: u32) -> Parsed {
+        let tz: Tz = "Europe/Berlin".parse().unwrap();
+        let now_local = tz.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap();
+        let ctx = ParseContext {
+            now_utc: now_local.with_timezone(&Utc),
+            tz,
+            language: Language::De,
+        };
+        parse(input, &ctx).expect("parse failed")
+    }
+
+    #[test]
+    fn rec_relative_monthly_from_day_31_keeps_short_months() {
+        // *1M on 31 Jan → 28 Feb, not 31 Mar.
+        let r = p_at("*1M miete", 2027, 1, 31);
+        assert!(rrule(&r).contains("BYSETPOS=-1"));
+        assert_eq!(r.fire_at(), local(2027, 2, 28, 12, 0));
+        assert_eq!(r.notes, vec![ParseNote::MonthlyLastDayFrom { day: 31 }]);
+    }
+
+    #[test]
+    fn rec_relative_every_three_months_from_day_31() {
+        // *3M on 31 Jan → 30 Apr, not 31 Jul.
+        let r = p_at("*3M bericht", 2027, 1, 31);
+        assert_eq!(r.fire_at(), local(2027, 4, 30, 12, 0));
+    }
+
+    #[test]
+    fn rec_relative_yearly_from_feb_29_uses_feb_28() {
+        // *1Y on 29 Feb 2028 → 28 Feb 2029, not 29 Feb 2032.
+        let r = p_at("*1Y jubiläum", 2028, 2, 29);
+        assert!(rrule(&r).contains("BYMONTHDAY=-1"));
+        assert_eq!(r.fire_at(), local(2029, 2, 28, 12, 0));
+        assert_eq!(r.notes, vec![ParseNote::YearlyFeb29Fallback]);
     }
 }
