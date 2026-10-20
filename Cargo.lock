@@ -26,6 +26,7 @@ dependencies = [
  "parser",
  "reqwest",
  "rrule",
+ "serde_json",
  "sqlx",
  "teloxide",
  "tokio",

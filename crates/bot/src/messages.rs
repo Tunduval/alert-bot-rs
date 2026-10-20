@@ -15,7 +15,7 @@ pub fn command_menu(lang: Language) -> Vec<(&'static str, &'static str)> {
             ("start", "begrüßt dich und richtet dein Profil ein"),
             ("help", "zeigt alle Befehle und Beispiele"),
             ("alert", "Reminder — nur du kannst ihn löschen (DM und Gruppen)"),
-            ("galert", "Gruppen-Reminder — jeder im Chat kann ihn löschen"),
+            ("galert", "Gruppen-Reminder — jedes aktuelle Mitglied kann ihn löschen"),
             ("list", "listet aktive Reminder im aktuellen Chat"),
             ("cancel", "löscht einen Reminder per ID"),
             ("tz", "setzt deine Zeitzone, z.B. Europe/Berlin"),
@@ -25,7 +25,7 @@ pub fn command_menu(lang: Language) -> Vec<(&'static str, &'static str)> {
             ("start", "say hi and set up your profile"),
             ("help", "show all commands and examples"),
             ("alert", "reminder — only you can cancel it (DMs and groups)"),
-            ("galert", "group reminder — anyone in the chat can cancel it"),
+            ("galert", "group reminder — any current member can cancel it"),
             ("list", "show active reminders in the current chat"),
             ("cancel", "delete a reminder by id"),
             ("tz", "set your timezone, e.g. Europe/Berlin"),
@@ -41,14 +41,16 @@ pub fn welcome(lang: Language) -> &'static str {
             /alert 30.4.26 Steuererklärung\n\
             /alert do 14:00 Standup\n\n\
             In Gruppen funktionieren beide: /alert für deine eigenen Reminder, \
-            /galert wenn ihn jeder verwalten können soll.\n\
+            /galert wenn ihn jedes aktuelle Mitglied verwalten können soll. \
+            Für /galert muss der Bot Gruppenadmin sein.\n\
             /help zeigt alle Befehle.",
         Language::En => "Hi! I'm your alert bot. Try messages like\n\
             /alert 5m coffee ready\n\
             /alert 30.4.26 file taxes\n\
             /alert thu 14:00 standup\n\n\
             Both work in groups: /alert for your own reminders, /galert when \
-            anyone in the chat should be able to manage it.\n\
+            any current member should be able to manage it. \
+            /galert requires the bot to be a group administrator.\n\
             /help lists every command.",
     }
 }
@@ -57,7 +59,7 @@ pub fn help(lang: Language) -> &'static str {
     match lang {
         Language::De => "<b>Befehle</b>\n\
             /alert &lt;zeit&gt; &lt;text&gt; — Reminder. Nur du kannst ihn löschen.\n\
-            /galert &lt;zeit&gt; &lt;text&gt; — Gruppen-Reminder. Jeder im Chat kann löschen.\n\
+            /galert &lt;zeit&gt; &lt;text&gt; — Gruppen-Reminder. Jedes aktuelle Mitglied kann löschen. Bot muss Gruppenadmin sein.\n\
             /list — aktive Reminder anzeigen\n\
             /cancel &lt;id&gt; — Reminder löschen\n\
             /tz &lt;zone&gt; — Zeitzone (z.B. Europe/Berlin)\n\
@@ -94,7 +96,7 @@ pub fn help(lang: Language) -> &'static str {
             <blockquote expandable><i>Intervall</i>\n\
             *30m Wasser — alle 30 Minuten\n\
             alle 2h Pause — synonym zu *2h\n\
-            *1d Vitamin — täglich um 09:00\n\
+            *1d Vitamin — täglich zur Erstellungs-Uhrzeit\n\
             *2d 11:00 Tabletten — alle 2 Tage 11:00\n\n\
             <i>Wochentage</i>\n\
             *do 14:00 Standup — jeden Donnerstag\n\
@@ -114,7 +116,7 @@ pub fn help(lang: Language) -> &'static str {
             • <i>heute</i>/<i>today</i> ist absichtlich raus — nimm direkt die Uhrzeit",
         Language::En => "<b>Commands</b>\n\
             /alert &lt;time&gt; &lt;text&gt; — reminder. Only you can cancel it.\n\
-            /galert &lt;time&gt; &lt;text&gt; — group reminder. Anyone in the chat can cancel.\n\
+            /galert &lt;time&gt; &lt;text&gt; — group reminder. Any current member can cancel. The bot must be a group administrator.\n\
             /list — show active reminders\n\
             /cancel &lt;id&gt; — delete a reminder\n\
             /tz &lt;zone&gt; — set timezone (e.g. Europe/Berlin)\n\
@@ -150,7 +152,7 @@ pub fn help(lang: Language) -> &'static str {
             <blockquote expandable><i>Interval</i>\n\
             *30m water — every 30 minutes\n\
             every 2h break — synonym for *2h\n\
-            *1d vitamin — daily at 09:00\n\
+            *1d vitamin — daily at the creation time\n\
             *2d 11:00 pills — every 2 days at 11:00\n\n\
             <i>Weekdays</i>\n\
             *thu 14:00 standup — every Thursday\n\
@@ -403,6 +405,12 @@ pub fn parse_note(note: ParseNote, lang: Language) -> String {
         (ParseNote::MonthlyLastDay, Language::En) => {
             "Note: in months without a 31st, this fires on the last day of the month.".into()
         }
+        (ParseNote::MonthlyLastDayFrom { day }, Language::De) => format!(
+            "Hinweis: in Monaten ohne {day}. feuert der Reminder am letzten Tag des Monats."
+        ),
+        (ParseNote::MonthlyLastDayFrom { day }, Language::En) => {
+            format!("Note: in months without day {day}, this fires on the last day of the month.")
+        }
         (ParseNote::YearlyFeb29Fallback, Language::De) => {
             "Hinweis: in Nicht-Schaltjahren feuert dieser Reminder am 28.2..".into()
         }
@@ -421,8 +429,8 @@ pub fn list_empty(lang: Language) -> &'static str {
 
 pub fn list_header(lang: Language) -> &'static str {
     match lang {
-        Language::De => "<b>Aktive Reminder</b>",
-        Language::En => "<b>Active reminders</b>",
+        Language::De => "Aktive Reminder",
+        Language::En => "Active reminders",
     }
 }
 
@@ -437,6 +445,42 @@ pub fn cancel_not_allowed(lang: Language) -> &'static str {
     match lang {
         Language::De => "Du darfst diesen Reminder nicht löschen.",
         Language::En => "You can't cancel this reminder.",
+    }
+}
+
+pub fn shared_membership_required(lang: Language) -> &'static str {
+    match lang {
+        Language::De => "Nur aktuelle Gruppenmitglieder dürfen diesen Reminder ändern.",
+        Language::En => "Only current group members can change this reminder.",
+    }
+}
+
+pub fn shared_membership_check_failed(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Ich konnte deine Gruppenmitgliedschaft nicht prüfen. Der Reminder bleibt unverändert."
+        }
+        Language::En => "I couldn't verify your group membership. The reminder was not changed.",
+    }
+}
+
+pub fn group_alert_bot_admin_required(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Ich muss Gruppenadmin sein, damit ich vor jeder Änderung die Mitgliedschaft prüfen kann. Es wurde nichts angelegt."
+        }
+        Language::En => {
+            "I must be a group administrator so I can check membership before every change. Nothing was created."
+        }
+    }
+}
+
+pub fn group_alert_bot_admin_check_failed(lang: Language) -> &'static str {
+    match lang {
+        Language::De => {
+            "Ich konnte meine Gruppenadmin-Rolle nicht prüfen. Es wurde nichts angelegt."
+        }
+        Language::En => "I couldn't verify my group administrator role. Nothing was created.",
     }
 }
 
@@ -511,6 +555,19 @@ mod tests {
                 len < TELEGRAM_LIMIT,
                 "help({lang:?}) is {len} chars, Telegram limit is {TELEGRAM_LIMIT}"
             );
+        }
+    }
+
+    /// `*1d` without an override fires at the creation time (RULES.md), so the
+    /// help example must not promise 09:00.
+    #[test]
+    fn help_relative_daily_example_does_not_promise_default_time() {
+        for lang in [Language::De, Language::En] {
+            let line = help(lang)
+                .lines()
+                .find(|l| l.starts_with("*1d "))
+                .unwrap_or_else(|| panic!("no *1d example in help({lang:?})"));
+            assert!(!line.contains("09:00"), "help({lang:?}): {line}");
         }
     }
 }

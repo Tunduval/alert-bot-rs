@@ -16,4 +16,16 @@ LXC_HOST="${LXC_HOST:-root@<lxc-ip>}"
 SERVICE="${1:-alert-bot}"
 TAIL_LINES="${2:-100}"
 
-exec ssh -t "$LXC_HOST" "journalctl -u $SERVICE -n $TAIL_LINES -f"
+if [[ ! "$SERVICE" =~ ^[A-Za-z0-9][A-Za-z0-9_.@:-]*$ ]]; then
+    echo "invalid systemd service name" >&2
+    exit 2
+fi
+
+if [[ ! "$TAIL_LINES" =~ ^[1-9][0-9]{0,4}$ ]] || (( TAIL_LINES > 10000 )); then
+    echo "tail line count must be between 1 and 10000" >&2
+    exit 2
+fi
+
+# OpenSSH joins remote arguments into a shell command. The strict allowlists
+# above make every interpolated value inert in that shell.
+exec ssh -t "$LXC_HOST" "exec journalctl --unit=${SERVICE} --lines=${TAIL_LINES} --follow"
