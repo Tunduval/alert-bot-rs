@@ -12,7 +12,9 @@ use teloxide::types::{
 
 use botcore::{AlertScope, ChatType, Language, NewAlert};
 use parser::ParseContext;
-use storage::{AlertLimits, CreateAlertOutcome, CreateSnoozeOutcome, PgStore};
+use storage::{
+    AlertLimits, CancelAlertOutcome, CreateAlertOutcome, CreateSnoozeOutcome, PgStore,
+};
 
 use crate::commands::Command;
 use crate::limits::{self, CommandRateLimiter};
@@ -299,11 +301,10 @@ async fn cancel(
         bot.send_message(msg.chat.id, m::cancel_not_allowed(lang)).await?;
         return Ok(());
     }
-    let ok = store.cancel_alert(id, requester).await?;
-    let reply = if ok {
-        m::cancel_ok(lang, id)
-    } else {
-        m::cancel_not_found(lang).to_string()
+    let reply = match store.cancel_alert(id, requester).await? {
+        CancelAlertOutcome::Cancelled => m::cancel_ok(lang, id),
+        CancelAlertOutcome::DeliveryStarted => m::cancel_delivery_started(lang).to_string(),
+        CancelAlertOutcome::NotCancellable => m::cancel_not_found(lang).to_string(),
     };
     bot.send_message(msg.chat.id, reply).await?;
     Ok(())
@@ -468,33 +469,37 @@ async fn handle_cancel_callback(
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
-    if callback_alert_in_origin_chat(store, query, alert_id)
-        .await?
-        .is_none()
-    {
+    let requester = query.from.id.0 as i64;
+    let Some(_alert) = callback_alert_in_origin_chat(store, query, alert_id).await? else {
         bot.answer_callback_query(query.id.clone())
             .text(m::cancel_not_allowed(lang))
             .show_alert(true)
             .await?;
         return Ok(());
-    }
-    let requester = query.from.id.0 as i64;
-    let ok = store.cancel_alert(alert_id, requester).await?;
-
-    if ok {
-        if let Some(msg) = query.message.as_ref() {
-            bot.edit_message_text(msg.chat().id, msg.id(), m::cancelled_inline(lang, alert_id))
-                .await
-                .ok();
+    };
+    match store.cancel_alert(alert_id, requester).await? {
+        CancelAlertOutcome::Cancelled => {
+            if let Some(msg) = query.message.as_ref() {
+                bot.edit_message_text(msg.chat().id, msg.id(), m::cancelled_inline(lang, alert_id))
+                    .await
+                    .ok();
+            }
+            bot.answer_callback_query(query.id.clone())
+                .text(m::callback_cancelled(lang))
+                .await?;
         }
-        bot.answer_callback_query(query.id.clone())
-            .text(m::callback_cancelled(lang))
-            .await?;
-    } else {
-        bot.answer_callback_query(query.id.clone())
-            .text(m::cancel_not_allowed(lang))
-            .show_alert(true)
-            .await?;
+        CancelAlertOutcome::DeliveryStarted => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::cancel_delivery_started(lang))
+                .show_alert(true)
+                .await?;
+        }
+        CancelAlertOutcome::NotCancellable => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::cancel_not_allowed(lang))
+                .show_alert(true)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -615,34 +620,39 @@ async fn handle_stop_series_callback(
     lang: Language,
     alert_id: i64,
 ) -> HandlerResult {
-    if callback_alert_in_origin_chat(store, query, alert_id)
-        .await?
-        .is_none()
-    {
+    let requester = query.from.id.0 as i64;
+    let Some(_alert) = callback_alert_in_origin_chat(store, query, alert_id).await? else {
         bot.answer_callback_query(query.id.clone())
             .text(m::cancel_not_allowed(lang))
             .show_alert(true)
             .await?;
         return Ok(());
-    }
-    let requester = query.from.id.0 as i64;
-    let ok = store.cancel_alert(alert_id, requester).await?;
-    if ok {
-        // Strip buttons first — the series is gone, so the +5m / Serie beenden
-        // controls on this delivered message would all no-op or surprise the user.
-        clear_inline_buttons(bot, query).await;
-        if let Some(msg) = query.message.as_ref() {
-            bot.send_message(msg.chat().id, m::series_stopped(lang, alert_id))
+    };
+    match store.cancel_alert(alert_id, requester).await? {
+        CancelAlertOutcome::Cancelled => {
+            // Strip buttons first — the series is gone, so the +5m / Serie beenden
+            // controls on this delivered message would all no-op or surprise the user.
+            clear_inline_buttons(bot, query).await;
+            if let Some(msg) = query.message.as_ref() {
+                bot.send_message(msg.chat().id, m::series_stopped(lang, alert_id))
+                    .await?;
+            }
+            bot.answer_callback_query(query.id.clone())
+                .text(m::callback_cancelled(lang))
                 .await?;
         }
-        bot.answer_callback_query(query.id.clone())
-            .text(m::callback_cancelled(lang))
-            .await?;
-    } else {
-        bot.answer_callback_query(query.id.clone())
-            .text(m::cancel_not_allowed(lang))
-            .show_alert(true)
-            .await?;
+        CancelAlertOutcome::DeliveryStarted => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::cancel_delivery_started(lang))
+                .show_alert(true)
+                .await?;
+        }
+        CancelAlertOutcome::NotCancellable => {
+            bot.answer_callback_query(query.id.clone())
+                .text(m::cancel_not_allowed(lang))
+                .show_alert(true)
+                .await?;
+        }
     }
     Ok(())
 }

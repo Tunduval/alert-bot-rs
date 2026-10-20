@@ -450,14 +450,18 @@ crates/
   Telegram secret-token header verified on every request.
 - **Worker** sleeps until the earliest pending alert's `fire_at` or until
   Postgres `NOTIFY alerts_changed` wakes it. Claimed alerts cycle
-  `pending → claimed → sent`. Each worker claims one alert at a time; every
-  claim increments `claim_generation` (migration 0005). Completion/retry writes
-  require the same generation and claimed state, fencing out old workers.
+  `pending → claimed → sending → sent`. Each worker claims one alert at a time;
+  every claim increments `claim_generation` (migration 0005). A row-locked
+  compare-and-set decides whether cancellation or external delivery starts.
+  Completion and retry writes require the same generation and `sending` state,
+  which fences out old workers.
   Transient failures are rescheduled with
   exponential backoff, permanent ones (`BotBlocked`, `ChatNotFound`,
   `UserDeactivated`) are marked `failed`.
-- **Reaper** unsticks claims left behind by crashed workers (default 60s
-  timeout) and purges old `processed_updates` rows.
+- **Reaper** unsticks `claimed` and `sending` rows left by crashed workers
+  (default 60s timeout) and purges old `processed_updates` rows. Retrying a
+  stale `sending` row preserves availability but can duplicate a message when
+  Telegram accepted the first request before the crash.
 - **Task lifecycle** — cancellation is retained while tasks are busy. A normal
   shutdown lets the worker finish its current delivery; unexpected worker exit
   fails the process so `Restart=on-failure` can restart it.

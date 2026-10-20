@@ -75,6 +75,7 @@ impl AlertScope {
 pub enum AlertState {
     Pending,
     Claimed,
+    Sending,
     Sent,
     Failed,
     Cancelled,
@@ -85,6 +86,7 @@ impl AlertState {
         match self {
             Self::Pending => "pending",
             Self::Claimed => "claimed",
+            Self::Sending => "sending",
             Self::Sent => "sent",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -95,6 +97,7 @@ impl AlertState {
         match s {
             "pending" => Some(Self::Pending),
             "claimed" => Some(Self::Claimed),
+            "sending" => Some(Self::Sending),
             "sent" => Some(Self::Sent),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),

@@ -16,7 +16,7 @@ use governor::{Quota, RateLimiter};
 /// past 500 is overwhelmingly junk or a DB-bloat probe.
 pub const MAX_TEXT_LEN: usize = 500;
 
-/// Maximum active (pending or claimed) alerts per Telegram user. Power users
+/// Maximum active (pending, claimed, or sending) alerts per Telegram user. Power users
 /// can hit this with legitimate recurring schedules; that's fine — they can
 /// `/cancel` something stale before adding more.
 pub const MAX_ALERTS_PER_USER: i64 = 100;

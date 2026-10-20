@@ -108,11 +108,30 @@ async fn deliver(bot: &Bot, store: &PgStore, alert: Alert) {
     };
 
     let keyboard = handlers::delivery_keyboard(lang, alert.id, alert.schedule.is_recurring());
-    let send = bot
+    let request = bot
         .send_message(ChatId(alert.chat_id), &body)
-        .reply_markup(keyboard)
-        .send()
-        .await;
+        .reply_markup(keyboard);
+    match store.begin_delivery(alert.id, alert.claim_generation).await {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                id = alert.id,
+                generation = alert.claim_generation,
+                "delivery claim was cancelled or reassigned before send"
+            );
+            return;
+        }
+        Err(e) => {
+            error!(
+                id = alert.id,
+                generation = alert.claim_generation,
+                error = ?e,
+                "begin_delivery failed"
+            );
+            return;
+        }
+    }
+    let send = request.send().await;
 
     match send {
         Ok(message) => {
@@ -222,9 +241,9 @@ async fn finalise_after_send(store: &PgStore, alert: &Alert) -> anyhow::Result<(
         }
     };
     if !applied {
-        // The claim guard rejected the write: the reaper released our claim
-        // while the send was in flight and the row was re-claimed or cancelled
-        // meanwhile. Don't resurrect it — just note the wasted double-send.
+        // The generation guard rejected the write: the reaper released our
+        // send lease and another worker re-claimed it. Don't overwrite the
+        // new owner; this remains an at-least-once delivery boundary.
         warn!(
             id = alert.id,
             "delivered but claim was no longer ours; not finalising"
