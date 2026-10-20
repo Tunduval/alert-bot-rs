@@ -18,8 +18,8 @@ jobs:
 
       - name: Enter a later fake-secret step
         env:
-          FAKE_LXC_SSH_KEY: fake-lxc-key-marker
-          FAKE_CF_SECRET: fake-cloudflare-secret-marker
+          FAKE_LXC_SSH_KEY: ${{ secrets.CANARY_LXC_SSH_KEY }}
+          FAKE_CF_SECRET: ${{ secrets.CANARY_CF_SECRET }}
         run: |
           result="$RUNNER_TEMP/ci-env-canary-result.txt"
           grep -Fxq 'next_step_hook=executed' "$result"
